@@ -1,0 +1,2 @@
+iced-x86==1.21.0
+pyelftools==0.33
