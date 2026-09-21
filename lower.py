@@ -159,7 +159,9 @@ def _scalar_scratch(ins, count, dead_registers):
     destination = ix.RegisterExt.full_register(ins.op0_register)
     if destination == ix.Register.RSP:
         raise LoweringError("RSP/ESP/SP destinations require a different trampoline")
-    candidates = sorted((r for r in _REGS if r != destination),
+    # Native frame-pointer walkers observe RBP even when normal-execution
+    # dataflow proves its old value dead. It is never an implicit temporary.
+    candidates = sorted((r for r in _REGS if r not in (destination, ix.Register.RBP)),
                         key=lambda r: r not in dead_registers)
     # MOVZX r32, AH/CH/DH/BH cannot carry REX. The first temporary receives
     # the source before any other register changes; this also handles aliases

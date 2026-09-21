@@ -177,9 +177,88 @@ Artifacts under `/tmp/static-penryn-next/`:
 - `native-paired-final2/benchmark.json`: all native wall/CPU samples,
   fixture hashes, executable identities and output checks.
 
-Final output SHA-256 values:
+Profile-guided baseline output SHA-256 values:
 
 ```
 agy:    ebebb78e825527af24199242e32678d79f5ebefe2da52a19db2caf4d647df004
 claude: 98a73111068079ebdc04b37b6304acbdc9803e0ec35c15c9ff3cb9d2d40b0036
+```
+
+
+The subsequent runtime revision adds the pinned SSE2 Count replacement,
+partial Go metadata registration, and inferred native unwind coverage.
+Final native measurements again used 21 alternating pairs after two warmups,
+with identical output checks and fresh credential-free homes. Initial
+background CPU was 2.53% busy. The same 44.56 MB regex fixture was used.
+
+| Workload | Earlier profile-guided baseline | Current output |
+|---|---:|---:|
+| agy `--version` | 177.20 ms | 174.57 ms |
+| agy `--help` | 180.59 ms | 174.79 ms |
+| Claude `--version` | 12.80 ms | 12.95 ms |
+| Claude `--help` | 243.53 ms | 244.77 ms |
+| Claude regex search, 44.56 MB | 58.18 ms | 58.04 ms |
+
+Agy's observed startup medians improve 1.5–3.2%; medians of paired speedup
+ratios are 1.019× for version and 1.025× for help. Claude's differences are
+small: version is 0.15 ms slower, help is 0.5% slower, and regex is 0.3%
+faster. These measurements do not establish a further Claude speedup.
+The active desktop and short processes limit precision.
+
+The registration path was validated in the actual agy payload. GDB observed
+its original `runtime.moduledataverify1` consume the synthetic module, with
+both registration pointers correctly linked, followed by normal exit.
+All seven final QEMU Penryn workloads passed; search, Unicode and file-list
+outputs matched the independently generated 8 × 32-line fixture. Additional
+agy version/help runs with `GOGC=1` produced byte-identical stdout and stderr
+to normal GC, using fresh allowlisted environments and no memory limit.
+The initializer executes once, with 37 guest instruction attempts. The
+in-place Count function executes 17,841 times in each startup workload.
+Its whole-function instruction total cannot be compared directly with the
+old profiles' totals for the seven isolated POPCNT lowerings.
+
+The performance check caught an otherwise unnecessary registration cost.
+A second, typeless module initially caused `runtime.typelinksinit` to hash
+the original module's types: its local instruction count rose from 11 to
+3,161,814. A paired diagnostic using identical lowerings and code layout
+measured about 8.5–9.6 ms additional startup time when registration ran.
+The [upstream type initialization code](https://go.dev/src/runtime/type.go)
+explains this extra work. The pinned correction redirects the existing
+single-module guard to the synthetic module's `next` pointer. Because the
+synthetic module contributes no types, the fast path remains valid while
+that pointer is nil; later appended modules retain the original slow path.
+Final counters confirm 11 local instructions with the initializer still
+active. This removes the observed regression while retaining registration.
+
+These are experimental outputs with the Go and native unwind coverage gaps
+reported by the patcher; successful workloads do not close those gaps.
+
+Reproduce the native comparison with the prepared artifacts:
+
+```sh
+python bench_apps.py \
+  --agy-before /tmp/static-penryn-next/agy-profiled-final \
+  --agy-after /tmp/static-penryn-runtime/agy-final-v4 \
+  --claude-before /tmp/static-penryn-next/claude-regions-final \
+  --claude-after /tmp/static-penryn-runtime/claude-final \
+  --work /tmp/penryn-runtime-timings
+```
+
+Evidence under `/tmp/static-penryn-runtime/`:
+
+- `native-paired-final-v4/benchmark.json`: all wall/CPU samples, fixture
+  hashes, input/output identities, output checks and CPU-load snapshot.
+- `workloads-final-v4/`: seven final QEMU profiles and verified outputs.
+- `gdb-final-v4/`: original-runtime module verification and normal exit.
+- `gogc-final-v4/`: bounded `GOGC=1` commands, allowlisted environments and
+  exact output comparisons; `check-gogc.py` reproduces these checks.
+- `typeguard-final-v4-profile/`: final initializer and type-init counters.
+- `type-init-isolation/` and `native-registration-isolation/`: diagnosis
+  using an explicitly unregistered development prototype.
+
+Current output SHA-256 values:
+
+```
+agy:    20e93e15bd444f4f2589ded9f78321eb8582cd9a538496c92fdb1f478bea51bd
+claude: c8eae7ef9fb28de5ac47f347f59293d16b7bca3793bd3531f5c5db10bdb83fd5
 ```

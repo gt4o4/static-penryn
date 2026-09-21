@@ -10,7 +10,7 @@ implementations. It does not translate a whole executable back into C/LLVM IR.
 | String arithmetic | Pinned MIT opemu core, compiled with GCC | Immediate specialization and wrapper/state/stack audits |
 | ELF/native frames | pyelftools ELF and DWARF parsers | Map generated PCs to original frame rows, reject unknown transformations |
 | Machine code and CFI | GNU assembler/linker; GCC helper CFI | Link addresses, frame-state translation and ELF publication |
-| Go function recovery | Go `debug/elf`, `debug/gosym`, `debug/buildinfo` | Validate stripped/C-archive candidates and audit unsupported runtime metadata |
+| Go function recovery | Go `debug/elf`, `debug/gosym`, `debug/buildinfo` | Validate stripped/C-archive candidates; version-check and emit the narrow Go runtime metadata contract |
 | Dynamic counts | QEMU's official plugin API/header and inline scoreboards | Exact binary/range/byte attribution and workload validation |
 | Native samples | Linux perf record/script | Map sampled PCs to generated sites and distinguish other mappings |
 
@@ -53,10 +53,14 @@ experiment is BOLT on a source-built native fixture with `--emit-relocs`,
 comparing its recovered blocks and layout against the same workload/oracle.
 That is an evaluation path, not a tested performance claim for these binaries.
 
-## Runtime limitation remains explicit
+## Runtime metadata reuse and limits
 
 Native DWARF CFI cannot express Go's function lookup, pc-value tables, stack
 maps, safe points or stack-growth protocol. Using the official Go parsers
-improves identification and refusal; it does not make appended Go code safe
-under all runtime operations. The strict gate and observed CPU-profile gap
+provides function identity and bounds. The new backend adds explicit,
+version-checked module registration for stack-neutral code; it reuses the
+original stack-map data rather than regenerating compiler GC maps. GNU tools
+emit initializer code and CFI. LLVM/GCC cannot infer a private Go runtime
+layout or recover missing pointer liveness from a stripped binary. These
+limits stay explicit in each accepted or rejected site. The strict gate and observed CPU-profile gap
 are described in [RUNTIME.md](RUNTIME.md).

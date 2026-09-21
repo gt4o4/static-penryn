@@ -27,7 +27,7 @@ SUPPORTED = frozenset(
     }
 )
 
-_SAVE = ("rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "rbp")
+_SAVE = ("rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12")
 _WIDE = frozenset({Code.PCMPESTRI64_XMM_XMMM128_IMM8, Code.PCMPESTRM64_XMM_XMMM128_IMM8})
 _FRAME = 144  # 80-byte C frame plus the four explicitly clobbered XMMs
 _ORIGINAL_RSP = 128 + 8 + 8 * len(_SAVE) + _FRAME
@@ -93,6 +93,7 @@ def build_helpers(instructions, core, work):
         "cc", "-O2", "-march=core2", "-mgeneral-regs-only", "-fPIC", "-ffreestanding",
         "-fno-stack-protector", "-mno-red-zone", "-ffunction-sections", "-fdata-sections",
         "-fasynchronous-unwind-tables", "-funwind-tables", "-fvisibility=hidden",
+        "-fno-omit-frame-pointer", "-mno-omit-leaf-frame-pointer",
         "-fstack-usage", "-I" + str(core), "-c", str(source), "-o", str(obj),
     ], check=True)
     usages = {}
@@ -180,15 +181,18 @@ def lower(ins):
 
     # Both lengths are initialized, including implicit forms: the wrapper's
     # source is valid C even before constant folding removes those arguments.
-    lines += ["mov [rsp + 64], rax", "mov [rsp + 72], rdx", "mov rbp, rsp",
+    # Preserve the original frame-pointer chain throughout the trampoline.
+    # R12 is saved above and preserved by the helper's SysV calling convention.
+    # The helper itself builds a conventional frame (compiler flags above).
+    lines += ["mov [rsp + 64], rax", "mov [rsp + 72], rdx", "mov r12, rsp",
               "mov rdi, rsp", "and rsp, -16", "cld", f"call {helper_name(key)}"]
-    lines += [f"mov rax, [rbp + {_SAVED_FLAGS}]", "and rax, -2262",
-              f"or rax, [rbp + {_FLAGS}]", f"mov [rbp + {_SAVED_FLAGS}], rax"]
+    lines += [f"mov rax, [r12 + {_SAVED_FLAGS}]", "and rax, -2262",
+              f"or rax, [r12 + {_FLAGS}]", f"mov [r12 + {_SAVED_FLAGS}], rax"]
     if not mask:
-        lines += [f"mov eax, [rbp + {_INDEX}]", f"mov [rbp + {_SAVED_RCX}], rax"]
+        lines += [f"mov eax, [r12 + {_INDEX}]", f"mov [r12 + {_SAVED_RCX}], rax"]
     else:
-        lines += ["movdqu xmm0, [rbp + 32]"]
-    lines += ["mov rsp, rbp"]
+        lines += ["movdqu xmm0, [r12 + 32]"]
+    lines += ["mov rsp, r12"]
     lines += [f"movdqu xmm{i}, [rsp + {80 + 16 * (i - 12)}]" for i in range(12, 16)]
     lines += [f"lea rsp, [rsp + {_FRAME}]"]
     lines += [f"pop {reg}" for reg in reversed(_SAVE)]

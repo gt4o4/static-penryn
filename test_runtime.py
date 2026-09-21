@@ -83,6 +83,27 @@ int main(int argc, char **argv) {
 }
 '''
 
+# Walk the interrupted frame chain directly, independently of libgcc/CFI.
+# A DWARF-only test would miss a trampoline repurposing RBP temporarily.
+FRAME_C_FIXTURE = C_FIXTURE.replace('#include <unwind.h>',
+    '#include <unwind.h>\n#include <pthread.h>\nstatic uintptr_t stack_low,stack_high;').replace(
+    'struct walk w = {0};\n  _Unwind_Backtrace(visit, &w);\n  samples++;',
+    '''struct walk w = {0};
+  uintptr_t bp = ctx->uc_mcontext.gregs[REG_RBP];
+  for (int depth=0; depth<32 && bp>=stack_low && bp<=stack_high-16 && !(bp&7); depth++) {
+    uintptr_t *frame=(uintptr_t *)bp;
+    if (frame[1] == (uintptr_t)caller_return) { w.found=1; break; }
+    if (frame[0]<=bp) break;
+    bp=frame[0];
+  }
+  samples++;''').replace(
+    'stub_begin = strtoull(argv[1], 0, 0);',
+    '''pthread_attr_t attr; void *stack; size_t size;
+  if (pthread_getattr_np(pthread_self(), &attr) || pthread_attr_getstack(&attr,&stack,&size)) return 26;
+  pthread_attr_destroy(&attr);
+  stack_low=(uintptr_t)stack; stack_high=stack_low+size;
+  stub_begin = strtoull(argv[1], 0, 0);''')
+
 ASM_FIXTURE = r'''
 .intel_syntax noprefix
 .text
@@ -163,6 +184,30 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertIn('failures=0',result.stdout)
         print('native timer:',result.stdout.strip())
+
+    def test_frame_pointer_walks_during_string_helper(self):
+        assembly = ASM_FIXTURE.replace('BODY','pcmpestri xmm1,xmm2,0x0c')
+        assembly = assembly.replace('sub rsp,8\n.cfi_adjust_cfa_offset 8\ncall exercise',
+            'push rbp\n.cfi_def_cfa_offset 16\n.cfi_offset rbp,-16\n'
+            'mov rbp,rsp\n.cfi_def_cfa_register rbp\ncall exercise')
+        assembly = assembly.replace('add rsp,8\n.cfi_adjust_cfa_offset -8\nret',
+            'pop rbp\n.cfi_def_cfa rsp,8\n.cfi_restore rbp\nret')
+        assembly = assembly.replace('push rbx\n.cfi_adjust_cfa_offset 8\n.cfi_offset rbx,-16',
+            'push rbp\n.cfi_def_cfa_offset 16\n.cfi_offset rbp,-16\n'
+            'mov rbp,rsp\n.cfi_def_cfa_register rbp\npush rbx\n.cfi_offset rbx,-24')
+        assembly = assembly.replace('pop rbx\n.cfi_adjust_cfa_offset -8\n.cfi_restore rbx\nret',
+            'pop rbx\n.cfi_restore rbx\npop rbp\n.cfi_def_cfa rsp,8\n.cfi_restore rbp\nret')
+        (self.work/'fixture.c').write_text(FRAME_C_FIXTURE)
+        (self.work/'fixture.S').write_text(assembly)
+        binary = self.work/'original'
+        subprocess.run(['cc','-O2','-fno-omit-frame-pointer','-no-pie',
+                        str(self.work/'fixture.c'),str(self.work/'fixture.S'),
+                        '-o',str(binary)],check=True)
+        output,limits,_ = self.patch(binary,'--no-dataflow')
+        result = subprocess.run([str(output),*limits,'timer'],capture_output=True,text=True,timeout=25)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertIn('failures=0',result.stdout)
+        print('native frame pointers:',result.stdout.strip())
 
     def test_fault_backtrace_and_fault_address_under_penryn(self):
         binary = self.compile('popcnt rax,QWORD PTR [rdi]')

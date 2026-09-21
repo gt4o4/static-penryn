@@ -1,5 +1,5 @@
 // Recover Go function boundaries with the standard library's debug/gosym.
-// This deliberately does not rewrite runtime.moduledata, pclntab or stack maps.
+// Metadata addresses let the fail-closed Python backend inspect selected functions.
 package main
 
 import (
@@ -15,14 +15,16 @@ import (
 )
 
 type Function struct {
-	Start uint64 `json:"start"`
-	End   uint64 `json:"end"`
-	Name  string `json:"name"`
+	Start    uint64 `json:"start"`
+	End      uint64 `json:"end"`
+	Name     string `json:"name"`
+	Metadata uint64 `json:"metadata_address"`
 }
 type Table struct {
 	Address   uint64     `json:"address"`
 	Text      uint64     `json:"text"`
 	Source    string     `json:"text_source"`
+	Module    uint64     `json:"module_address,omitempty"`
 	Functions []Function `json:"functions"`
 }
 type Report struct {
@@ -164,6 +166,7 @@ func run(path string) error {
 				reject("function table extends outside section")
 				continue
 			}
+			var module uint64
 			text, source := get(24), "pcHeader.textStart"
 			if value, ok := relative[address+24]; ok {
 				text = value
@@ -215,6 +218,7 @@ func run(path string) error {
 					maxpc, ok3 := word(candidate + 168)
 					if good && ok && ok2 && ok3 && base == minpc && maxpc > base && executable(base) && executable(maxpc-1) {
 						text = base
+						module = candidate
 						source = "validated Go 1.20+ moduledata prefix"
 						break
 					}
@@ -233,14 +237,14 @@ func run(path string) error {
 				reject("gosym function count disagrees")
 				continue
 			}
-			out := Table{Address: address, Text: text, Source: source, Functions: make([]Function, 0, len(tab.Funcs))}
+			out := Table{Address: address, Text: text, Source: source, Module: module, Functions: make([]Function, 0, len(tab.Funcs))}
 			var previousEnd uint64
-			for _, fn := range tab.Funcs {
+			for index, fn := range tab.Funcs {
 				if fn.End <= fn.Entry || fn.Entry < previousEnd || !executable(fn.Entry) || !executable(fn.End-1) {
 					valid = false
 					break
 				}
-				out.Functions = append(out.Functions, Function{fn.Entry, fn.End, fn.Name})
+				out.Functions = append(out.Functions, Function{fn.Entry, fn.End, fn.Name, address + get(64) + uint64(binary.LittleEndian.Uint32(d[get(64)+uint64(index)*8+4:]))})
 				previousEnd = fn.End
 			}
 			if !valid {

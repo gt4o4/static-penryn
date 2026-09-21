@@ -37,20 +37,42 @@ class Unsupported(ValueError):
 
 
 class Index:
-    def __init__(self, elf):
+    def __init__(self, elf, *, frame_recovery=None):
         self.elf = elf
+        self.frame_recovery = frame_recovery
+        self.inferred = {}
         section = elf.get_section_by_name('.eh_frame')
         self.address = section['sh_addr'] if section is not None else 0
         dwarf = elf.get_dwarf_info(relocate_dwarf_sections=False, follow_links=False)
         self.fdes = sorted((f for f in dwarf.EH_CFI_entries() if isinstance(f, FDE)
                             and f['address_range']), key=lambda f: f['initial_location']) if dwarf.has_EH_CFI() else []
         self.starts = [f['initial_location'] for f in self.fdes]
+        self.prefix_ends = []
+        maximum = 0
+        for fde in self.fdes:
+            maximum = max(maximum, fde['initial_location'] + fde['address_range'])
+            self.prefix_ends.append(maximum)
         self.cache = {}
 
     def row(self, pc):
         j = bisect_right(self.starts, pc) - 1
-        if j < 0 or pc >= self.starts[j] + self.fdes[j]['address_range']:
+        covering = []
+        while j >= 0 and self.prefix_ends[j] > pc:
+            if pc < self.starts[j] + self.fdes[j]['address_range']:
+                covering.append(j)
+                if len(covering) > 1:
+                    raise Unsupported('multiple original FDEs cover this PC; native frame is ambiguous')
+            j -= 1
+        if not covering:
+            if self.frame_recovery is not None:
+                try:
+                    row = self.frame_recovery.row(pc)
+                except ValueError as error:
+                    raise Unsupported(f'original PC has no native FDE; frame inference: {error}') from error
+                self.inferred[pc] = self.frame_recovery.evidence(pc)
+                return row
             raise Unsupported('original PC has no native .eh_frame FDE')
+        j = covering[0]
         fde = self.fdes[j]
         if fde.cie['return_address_register'] != 16:
             raise Unsupported('nonstandard return-address register')
@@ -358,7 +380,8 @@ class Result:
     report: dict
 
 
-def build(elf, blob, code_address, ranges, metadata_address, work, *, helper_elf=None):
+def build(elf, blob, code_address, ranges, metadata_address, work, *, helper_elf=None,
+          frame_recovery=None, extra_helpers=()):
     """Emit new FDEs and a merged GNU index, with explicit uncovered ranges.
 
     Each range is {start, end, original_pc}. Ranges must start at an original
@@ -368,7 +391,7 @@ def build(elf, blob, code_address, ranges, metadata_address, work, *, helper_elf
     PT_GNU_EH_FRAME using header_address/header_size and map these bytes.
     """
     work = Path(work)
-    index = Index(elf)
+    index = Index(elf, frame_recovery=frame_recovery)
     assembly, layout, covered, gaps = [], [], [], []
     previous_end = code_address
     for n, item in enumerate(sorted(ranges, key=lambda r: r['start'])):
@@ -376,6 +399,9 @@ def build(elf, blob, code_address, ranges, metadata_address, work, *, helper_elf
         if not code_address <= start < end <= code_address + len(blob) or start < previous_end:
             raise ValueError('invalid or overlapping unwind range')
         previous_end = end
+        if item.get('runtime') == 'go':
+            gaps.append({**item, 'reason': 'Go frame needs runtime metadata; SysV frame inference is inapplicable'})
+            continue
         try:
             body = assembly_for_range(index, blob[start-code_address:end-code_address], start, original_pc)
         except Unsupported as error:
@@ -383,24 +409,31 @@ def build(elf, blob, code_address, ranges, metadata_address, work, *, helper_elf
             continue
         assembly += [f'.section .text.unwind_{n},"ax",@progbits'] + body
         layout.append(f'.text.unwind_{n} {start} : {{ *(.text.unwind_{n}) }}')
-        covered.append(item)
+        covered.append({**item, 'source': 'inferred-native-cfg' if original_pc in index.inferred else 'original-fde'})
     helper_count = 0
+    helper_inputs = list(extra_helpers)
     if helper_elf is not None:
-        with Path(helper_elf).open('rb') as stream:
+        helper_inputs.insert(0, (helper_elf, code_address, code_address + len(blob), 'compiler_helper'))
+    for helper_path, allowed_start, allowed_end, helper_kind in helper_inputs:
+        with Path(helper_path).open('rb') as stream:
             helpers = Index(ELFFile(stream))
+            if helper_kind == 'go_initializer' and [
+                    (f['initial_location'], f['initial_location'] + f['address_range'])
+                    for f in helpers.fdes] != [(allowed_start, allowed_end)]:
+                raise ValueError('Go initializer needs complete compiler-authored CFI')
             for n, fde in enumerate(helpers.fdes):
                 start, end = fde['initial_location'], fde['initial_location'] + fde['address_range']
-                item = {'start': start, 'end': end, 'kind': 'compiler_helper'}
-                if not code_address <= start < end <= code_address + len(blob):
+                item = {'start': start, 'end': end, 'kind': helper_kind}
+                if not allowed_start <= start < end <= allowed_end:
                     raise ValueError('helper FDE lies outside injected payload')
-                if any(start < r['end'] and end > r['start'] for r in ranges):
+                if any(start < r['end'] and end > r['start'] for r in ranges + covered):
                     raise ValueError('helper FDE overlaps instruction-lowering range')
                 try:
                     body = _helper_assembly(fde)
                 except Unsupported as error:
                     gaps.append({**item, 'reason': str(error)})
                     continue
-                name = f'.text.helper_unwind_{n}'
+                name = f'.text.helper_unwind_{helper_count}'
                 assembly += [f'.section {name},"ax",@progbits'] + body
                 layout.append(f'{name} {start} : {{ *({name}) }}')
                 covered.append(item)
@@ -444,6 +477,8 @@ def build(elf, blob, code_address, ranges, metadata_address, work, *, helper_elf
     report = {'covered_ranges': covered, 'uncovered_ranges': gaps,
               'original_fdes': len(index.fdes), 'new_fdes': len(new_entries),
               'compiler_helper_fdes': helper_count,
+              'inferred_ranges': sum(r.get('source') == 'inferred-native-cfg' for r in covered),
+              'frame_recovery': frame_recovery.report() if frame_recovery is not None else None,
               'native_coverage_complete': not gaps,
               'native_backtrace_only': True, 'go_safepoints_supported': False,
               'exception_landing_pads_supported': False,

@@ -141,12 +141,66 @@ again:
             profiles.append(weights)
         self.assertEqual(profiles[0], profiles[1])
 
+    def test_loader_preinit_before_entry_is_counted(self):
+        # The loader runs PREINIT_ARRAY before _start. entry_seen is an
+        # identity check, not a condition for arming counters.
+        source=self.work/'preinit.S'
+        source.write_text('''
+.intel_syntax noprefix
+.text
+.global _start
+_start:
+    mov edi, 1
+    cmp dword ptr [rip + ready], 1
+    jne done
+    xor edi, edi
+done:
+    mov eax, 60
+    syscall
+.section .penryn,"ax",@progbits
+.global preinit, preinit_end
+preinit:
+    mov dword ptr [rip + ready], 1
+    ret
+preinit_end:
+.section .preinit_array,"aw",@preinit_array
+    .quad preinit
+.bss
+ready:
+    .zero 4
+.section .note.GNU-stack,"",@progbits
+''')
+        binary=self.work/'preinit'
+        subprocess.run(['cc','-nostdlib','-pie','-Wl,--no-as-needed','-lc',
+                        '-o',str(binary),str(source)],check=True,capture_output=True)
+        data=binary.read_bytes();elf=ELFFile(io.BytesIO(data))
+        symbols={s.name:s['st_value'] for s in elf.get_section_by_name('.symtab').iter_symbols()}
+        report=dict(input_sha256='0'*64,output_sha256=hashlib.sha256(data).hexdigest(),patches=[],
+                    helpers=[dict(name='preinit',start=symbols['preinit'],end=symbols['preinit_end'])])
+        path=self.work/'preinit.json';path.write_text(json.dumps(report))
+        result=profiler.count(profiler.load_model(binary,path),[],self.work/'count-preinit')
+        self.assertEqual((result['rows'][0]['entries'],result['rows'][0]['generated_instructions']),(1,2))
+
     def test_wrong_binary_rejected_before_execution(self):
         binary, report = self.fixture()
         with binary.open('ab') as f:
             f.write(b'changed')
         with self.assertRaisesRegex(ValueError, 'SHA-256'):
             profiler.load_model(binary, report)
+
+    def test_inplace_code_counts_without_inventing_instruction_weights(self):
+        binary, path = self.fixture()
+        report = json.loads(path.read_text())
+        start = int(report['patches'][0]['stub'], 16)
+        end = int(report['patches'][0]['stub_end'], 16)
+        report['patches'] = []
+        report['inplace_patches'] = [dict(address=start, evidence=dict(function='counter', code_bytes=end-start))]
+        path.write_text(json.dumps(report))
+        result = profiler.count(profiler.load_model(binary, path), [], self.work/'count-inplace')
+        self.assertEqual(result['site_counts'], [])
+        helper = next(row for row in result['rows'] if row['kind'] == 'helper')
+        self.assertTrue(helper['inplace'])
+        self.assertEqual((helper['entries'], helper['generated_instructions']), (1000, 3000))
 
     def test_wrong_runtime_bias_does_not_silently_report_zero(self):
         binary, report = self.fixture()

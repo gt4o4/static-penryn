@@ -81,6 +81,13 @@ def load_model(binary, report_path, *, legacy=False):
                 mnemonic=ins['mnemonic'], range_accuracy='exact')
     for helper in report.get('helpers', []):
         add('helper', helper['start'], helper['end'], name=helper['name'], range_accuracy='exact')
+    for item in report.get('inplace_patches', []):
+        # A whole-function algorithm replacement has no one-to-one mapping
+        # to its former POPCNT instructions. Count its real code as a helper.
+        start = number(item['address'])
+        evidence = item['evidence']
+        add('helper', start, start + number(evidence['code_bytes']),
+            name=evidence['function'], range_accuracy='exact', inplace=True)
     for kind in ('site', 'instruction', 'helper'):
         group = sorted((r for r in rows if r['kind'] == kind), key=lambda r: r['start'])
         if any(a['end'] > b['start'] for a, b in zip(group, group[1:])):

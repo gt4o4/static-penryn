@@ -44,6 +44,10 @@ let
       ./controlflow.py
       ./regions.py
       ./unwind.py
+      ./native_frames.py
+      ./go_lower.py
+      ./go_runtime.py
+      ./go_inplace.py
       ./lower.py
       ./strings.py
       ./strings.c

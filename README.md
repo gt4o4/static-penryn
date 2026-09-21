@@ -12,10 +12,49 @@ Only arithmetic is reused, not the emulator's runtime machinery.
 **An experiment, not enabled in `penryn-overlays.nix`.** Both current
 applications pass the no-emulator tests below. Bounded control-flow recovery,
 profiling, shared regions and optional native unwind metadata are implemented.
-Go runtime metadata and complete indirect-entry/fault-context recovery remain
-unresolved; strict runtime mode refuses the affected applications.
+A restricted Go metadata backend, in-place Go counter and native frame
+recovery are now implemented. Full application coverage and complete
+indirect-entry/fault-context recovery remain incomplete; strict mode still
+refuses unresolved cases.
 
-## Profiling, regions and runtime pass, 2026-09-21
+## Runtime repair pass, 2026-09-21
+
+- Native scalar and string code preserves RBP frame chains. `--infer-unwind`
+  adds conservative CFG-based frame recovery where original CFI is absent.
+- `--go-inplace` replaces agy's seven countbody POPCNT sites with an SSE2
+  function that fits the original bytes and retains zero-stack-delta metadata.
+- `--go-dispatch` protects 18 original SSE4.2 sites behind verified feature
+  guards, with full proof-function byte checks.
+- `--go-runtime` registers supported stack-neutral POPCNT replacements with
+  Go's own function, PC and stack metadata. It supports verified runtime layouts
+  and records rejected sites; `--require-runtime` enforces complete Go coverage.
+- The Go lowering reuses the existing arithmetic, chooses proven-dead GPRs
+  before parking scratch state in XMM, and reserves Go's stack/runtime registers.
+  **124,800** hardware state comparisons pass. The countbody harness validates
+  **1,225,380** cases through both Go ABI0 wrappers, including guard pages.
+- Executable and PIE registration fixtures verify GC, stack growth, function
+  lookup and named CPU profiles. See [RUNTIME.md](RUNTIME.md) for the contracts,
+  commands and remaining application blockers.
+- The pinned agy backend retains Go's type-initialization fast path for the
+  empty added module. A checked four-byte guard adjustment avoids 3.16 million
+  startup guest instructions while preserving deduplication for later modules.
+
+On the current inputs, these paths handle **31 of agy's 52 Go sites**:
+seven in place, 18 behind verified dispatch guards and six with registered
+metadata. **21 sites still lack a proven stack-neutral scratch allocation.**
+Claude gains **243 inferred native unwind ranges**, including the hot fused
+regex region; **1,630 generated ranges remain uncovered**. agy also retains
+two native unwind gaps involving unavailable caller RBX values. Full strict
+deployment remains blocked. The following sections retain earlier-pass results
+for comparison; [RUNTIME.md](RUNTIME.md) records the new coverage.
+
+Validation covers **181 regression cases** and all seven deterministic QEMU
+Penryn workloads. In 21 paired native runs, agy's median version/help startup
+times improve **1.5% / 3.2%** over the previous static patches; Claude remains
+essentially unchanged. [PROFILING.md](PROFILING.md) records the measurements,
+the diagnosed type-initialization cost and the final artifact hashes.
+
+## Earlier profiling, regions and runtime pass, 2026-09-21
 
 - **Reproducible profiling:** `static-penryn workloads` creates independent
   expected results for version/help, UTF-8 regex, Unicode properties and file
@@ -42,7 +81,7 @@ unresolved; strict runtime mode refuses the affected applications.
   frame rows and compiler helper CFI. `--require-unwind` refuses missing native
   coverage or unresolved Go runtime metadata. Native timer-signal backtraces,
   fault unwinding and a bounded Go GC/profiling fixture exercise these paths.
-  The Go fixture completes, but profiling exposes appended PCs as
+  Without the new Go registration backend, that fixture completes but exposes appended PCs as
   `runtime._ExternalCode`; this remains a strict rejection, not a solved
   safepoint/stack-growth problem. See [RUNTIME.md](RUNTIME.md).
 
@@ -238,6 +277,12 @@ claude=/nix/store/hmvhip68hbn4mshzblpji6634gzslh00-claude-code-2.1.278/bin/.clau
 "$tool" "$claude" /tmp/claude-regions --allow-relocate --regions \
   --region-loads --profile /tmp/penryn-workloads/claude-combined.json --unwind
 
+# Opt-in runtime repair on these exact inputs; all gaps stay in the reports.
+"$tool" "$agy" /tmp/agy-runtime --allow-relocate --unwind \
+  --go-inplace --go-dispatch --go-runtime
+"$tool" "$claude" /tmp/claude-runtime --allow-relocate --regions \
+  --region-loads --infer-unwind
+
 # Strict mode refuses both full apps until their runtime gaps are resolved.
 # --require-unwind is useful for supported native fixtures with complete CFI.
 
@@ -268,6 +313,10 @@ constants without the executable section flag. Their LOAD mapping is RX.
 `--unwind` additionally installs `.penryn.eh_frame` and
 `.penryn.eh_frame_hdr`, both without the executable section flag, and updates
 or adds `PT_GNU_EH_FRAME` while retaining original native frame records.
+Registered Go stubs add writable, non-executable `.penryn.go_data` in a separate
+LOAD and a small RX initializer with its own native CFI. In-place recipes retain
+their original function ranges. Proven dormant instructions remain unchanged
+and are explicitly listed; final decoding must match precisely that list.
 
 Four-byte POPCNT cannot hold that JMP. The tool first tries a two-byte JMP
 to unused nearby padding after a terminating instruction, then a full JMP
@@ -321,7 +370,8 @@ the patcher verifies it before publishing output.
   are behind its feature dispatcher on honest Penryn; do not assume they
   are safe on a tiny Go stack merely because startup works.
 - Optional native CFI covers supported frame rules, with gaps reported;
-  it does not relocate C++ landing pads or Go stack maps/safe points.
+  it does not relocate C++ landing pads. The separate Go backend supports
+  only the registered stack-neutral contract in [GO-RUNTIME.md](GO-RUNTIME.md).
   Go refuses unknown PCs as async safe points, but faults/profilers/signals
   can observe a temporary stack/register state. Exact original fault PC
   and signal-context semantics are not preserved. Sustained real workloads

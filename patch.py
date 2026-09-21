@@ -95,8 +95,9 @@ class Site:
         return self.insns[0].ip
 
 
-def scan(elf, *, inventory_only=False, metadata=None, recovery=None):
+def scan(elf, *, inventory_only=False, metadata=None, recovery=None, frame_recovery=None):
     hits, targets, caves = [], {elf['e_entry']}, []
+    frame_pointers = set()
     if metadata:
         targets.update(metadata['pointer_targets'])
     for sec in elf.iter_sections():
@@ -123,6 +124,8 @@ def scan(elf, *, inventory_only=False, metadata=None, recovery=None):
         for ins in Decoder(64, data, ip=sec['sh_addr']):
             if recovery is not None:
                 recovery.feed(ins)
+            if frame_recovery is not None:
+                frame_recovery.feed(ins)
             flow = ins.flow_control
             mnemonic = ins.mnemonic
             if flow != FlowControl.NEXT and ins.op0_kind in (
@@ -131,6 +134,8 @@ def scan(elf, *, inventory_only=False, metadata=None, recovery=None):
                 targets.add(ins.near_branch_target)
             if ins.is_ip_rel_memory_operand:
                 targets.add(ins.ip_rel_memory_address)
+                if frame_recovery is not None:
+                    frame_pointers.add(ins.ip_rel_memory_address)
             if mnemonic in (Mnemonic.MOV, Mnemonic.PUSH):
                 # Retained immediate code pointers matter even in stripped
                 # ET_EXEC images (movabs/jmp, push/ret). False positives here
@@ -139,6 +144,8 @@ def scan(elf, *, inventory_only=False, metadata=None, recovery=None):
                     if ins.op_kind(op) in (OpKind.IMMEDIATE32, OpKind.IMMEDIATE64,
                                           OpKind.IMMEDIATE32TO64):
                         targets.add(ins.immediate(op) & ((1 << 64) - 1))
+                        if frame_recovery is not None:
+                            frame_pointers.add(ins.immediate(op) & ((1 << 64) - 1))
             is_padding = mnemonic in (Mnemonic.NOP, Mnemonic.INT3)
             if is_padding and (padding is not None or previous_terminates):
                 if padding is None:
@@ -158,6 +165,12 @@ def scan(elf, *, inventory_only=False, metadata=None, recovery=None):
     if recovery is not None:
         recovery.finish()
         targets.update(recovery.targets)
+    if frame_recovery is not None:
+        frame_pointers.update((metadata or {}).get('pointer_targets', ()))
+        if recovery is not None:
+            frame_pointers.update(recovery.targets)
+        frame_recovery.finish(address_taken=frame_pointers)
+        targets.update(frame_recovery.entries)
     return hits, targets, caves
 
 
@@ -278,7 +291,7 @@ def _relocate_tail(ins, address):
     return code
 
 
-def build_stubs(sites, address, work, core, *, region_loads=False):
+def build_stubs(sites, address, work, core, *, region_loads=False, go_bodies=None):
     import lower
     import strings
     import regions
@@ -294,7 +307,9 @@ def build_stubs(sites, address, work, core, *, region_loads=False):
             prefix, suffix, sharing, body = [], [], {}, []
             for ins in steps:
                 hint = hints.get(ins.ip, Hints())
-                if ins.mnemonic in lower.SUPPORTED:
+                if go_bodies is not None and ins.ip in go_bodies:
+                    body.append(go_bodies[ins.ip])
+                elif ins.mnemonic in lower.SUPPORTED:
                     body.append(lower.lower(ins, preserve_flags=hint.preserve_flags,
                                             dead_registers=hint.dead_registers,
                                             dead_xmms=hint.dead_xmms))
@@ -381,8 +396,15 @@ def build_stubs(sites, address, work, core, *, region_loads=False):
     raise ValueError('relocated instruction layout failed to converge')
 
 
-def rewrite(data, elf, sites, blob, syms, load_off, load_va, code_off, unwind_result=None):
+def rewrite(data, elf, sites, blob, syms, load_off, load_va, code_off, unwind_result=None,
+            *, inplace=(), go_result=None, go_metadata_va=None, go_installer_va=None):
     result = bytearray(data)
+    for item in inplace:
+        off = va_offset(elf, item['address'])
+        original, replacement = item['original_bytes'], item['replacement_bytes']
+        if len(original) != len(replacement) or result[off:off+len(original)] != original:
+            raise ValueError('in-place replacement bytes/length changed after planning')
+        result[off:off+len(original)] = replacement
     for n, s in enumerate(sites):
         dest = syms[f'site_{n}']
         if s.cave is None:
@@ -396,10 +418,23 @@ def rewrite(data, elf, sites, blob, syms, load_off, load_va, code_off, unwind_re
     metadata_offset = align(len(payload), 8)
     if unwind_result is not None:
         payload += bytes(metadata_offset - len(payload)) + unwind_result.blob
+    installer_offset = None
+    if go_result is not None:
+        installer_offset = go_installer_va - load_va - code_off
+        if installer_offset < len(payload):
+            raise ValueError('Go initializer overlaps emitted code or native CFI')
+        payload += bytes(installer_offset - len(payload)) + go_result['constructor_bytes']
+        if go_metadata_va < align(load_va + code_off + len(payload)):
+            raise ValueError('Go writable metadata overlaps an executable page')
+        for item in go_result['patches']:
+            off, old, new = item['offset'], item['old'], item['new']
+            if len(old) != len(new) or result[off:off+len(old)] != old:
+                raise ValueError('Go loader patch no longer matches original bytes')
+            result[off:off+len(old)] = new
     phoff, old_phnum = elf['e_phoff'], elf['e_phnum']
     headers = bytearray(data[phoff:phoff + old_phnum * 56])
     has_eh_header = any(seg['p_type'] == 'PT_GNU_EH_FRAME' for seg in elf.iter_segments())
-    phnum = old_phnum + 1 + int(unwind_result is not None and not has_eh_header)
+    phnum = old_phnum + 1 + int(unwind_result is not None and not has_eh_header) + int(go_result is not None)
     if phnum >= 65535 or code_off < phnum * 56:
         raise ValueError('insufficient space for new program headers')
     for n in range(old_phnum):
@@ -418,8 +453,15 @@ def rewrite(data, elf, sites, blob, syms, load_off, load_va, code_off, unwind_re
         address = unwind_result.header_address
         headers += struct.pack('<IIQQQQQQ', 0x6474e550, 4, load_off + address - load_va,
                                address, address, unwind_result.header_size, unwind_result.header_size, 4)
+    if go_result is not None:
+        go_offset = load_off + go_metadata_va - load_va
+        go_size = len(go_result['blob'])
+        headers += struct.pack('<IIQQQQQQ', 1, 6, go_offset, go_metadata_va,
+                               go_metadata_va, go_size, go_size, 4096)
     result += bytes(load_off - len(result))
     result += headers + bytes(code_off - len(headers)) + payload
+    if go_result is not None:
+        result += bytes(go_offset-len(result)) + go_result['blob']
     struct.pack_into('<Q', result, 32, load_off)
     struct.pack_into('<H', result, 56, phnum)
     address = load_va + code_off
@@ -432,6 +474,11 @@ def rewrite(data, elf, sites, blob, syms, load_off, load_va, code_off, unwind_re
     if unwind_result is not None:
         extra_sections += [{**sec, 'offset': metadata_offset + sec['offset'], 'flags': 2}
                            for sec in unwind_result.sections]
+    if go_result is not None:
+        extra_sections += [dict(name='.penryn.go_init', offset=installer_offset,
+                                size=len(go_result['constructor_bytes']), flags=6, alignment=16),
+                           dict(name='.penryn.go_data', offset=go_metadata_va-address,
+                                size=go_size, flags=3, alignment=4096)]
     old_shoff, shnum = elf['e_shoff'], elf['e_shnum']
     if shnum + len(extra_sections) >= 65280:
         raise ValueError('new section count requires unsupported extended ELF numbering')
@@ -465,12 +512,17 @@ def main():
     p.add_argument('--regions', action='store_true', help='group bounded straight-line sites; requires --allow-relocate')
     p.add_argument('--region-loads', action='store_true', help='also relocate read-only load glue in regions; original fault contexts are not preserved')
     p.add_argument('--unwind', action='store_true', help='emit native backtrace metadata with explicit coverage gaps')
-    p.add_argument('--require-unwind', action='store_true', help='require complete native unwind coverage and audited absence of patched Go code')
+    p.add_argument('--infer-unwind', action='store_true', help='infer missing native frames from bounded trusted-entry CFGs; implies --unwind')
+    p.add_argument('--go-inplace', action='store_true', help='apply the pinned stack-neutral agy Go countbody recipe')
+    p.add_argument('--go-dispatch', action='store_true', help='retain exact agy Go SSE4.2 paths proven unreachable on Penryn')
+    p.add_argument('--go-runtime', action='store_true', help='register supported stack-neutral Go replacements; report unsupported sites explicitly')
+    p.add_argument('--require-runtime', action='store_true', help='require every patched Go site to have verified runtime metadata')
+    p.add_argument('--require-unwind', action='store_true', help='require complete native unwind coverage and verified runtime metadata for patched Go code')
     p.add_argument('--allow-relocate', action='store_true', help='experimental: borrow next instruction at short sites; known entry points protected, indirect entries not proven')
     p.add_argument('--core', type=Path, default=HERE.parents[2] / 'submodules/opemu-linux/core')
     p.add_argument('--work-dir', type=Path, help='retain generated assembly and linked helpers')
     args = p.parse_args()
-    args.unwind |= args.require_unwind
+    args.unwind |= args.require_unwind or args.infer_unwind
     if args.regions and not args.allow_relocate:
         p.error('--regions requires --allow-relocate')
     if args.region_loads and not args.regions:
@@ -497,12 +549,22 @@ def main():
     from controlflow import Recovery
     weights = regions.read_profile(args.profile, digest(data)) if args.profile else None
     go_metadata = unwind.load_go_metadata(args.input)
+    go_audit = None
+    if args.go_inplace or args.go_runtime or args.go_dispatch:
+        if go_metadata is None:
+            p.error('Go transformations require the packaged Go metadata helper')
+        import go_runtime
+        go_audit = go_runtime.Audit(data, elf, go_metadata)
     functions = [(f['start'], f['end'], f['name']) for table in (go_metadata or {}).get('tables', [])
                  for f in table['functions']]
     recovery = Recovery(elf)
     recovery.add_functions(functions, source='go')
+    frame_recovery = None
+    if args.infer_unwind:
+        import native_frames
+        frame_recovery = native_frames.Recovery(elf, recovery)
     print('Decoding executable sections...', flush=True)
-    hits, targets, caves = scan(elf, metadata=metadata, recovery=recovery)
+    hits, targets, caves = scan(elf, metadata=metadata, recovery=recovery, frame_recovery=frame_recovery)
     cfg_report = recovery.finish()
     scanned = time.perf_counter()
     counts = Counter(FAMILIES[i.mnemonic] for i, _ in hits)
@@ -511,33 +573,78 @@ def main():
         return
     if not hits:
         p.error('no supported instructions found')
-    sites = plan(elf, hits, targets, caves, args.allow_relocate,
+    inplace, unchanged_functions = [], []
+    if args.go_inplace:
+        import go_inplace
+        inplace = go_inplace.plan(data, elf, go_metadata)
+        unchanged_functions += [(a, b, sha) for name, (a, b, sha) in go_inplace.PINNED.items()
+                                if name != 'countbody']
+    dormant = []
+    if args.go_dispatch:
+        import go_inplace
+        dormant = go_inplace.dormant(data, elf, go_metadata)
+        unchanged_functions += list(go_inplace.DISPATCH_PINNED.values())
+    dormant_sites = {item['address'] for item in dormant}
+    inplace_sites = {pc for item in inplace for pc in item['covered_original_sites']}
+    protected_ranges = (metadata['relocation_ranges'] + recovery.table_ranges +
+                        [(item['address'], item['address']+len(item['replacement_bytes'])) for item in inplace] +
+                        [(item['address'], item['address']+len(item['original_bytes'])) for item in dormant] +
+                        [(a, b) for a, b, _ in unchanged_functions])
+    sites = plan(elf, [(ins, sec) for ins, sec in hits if ins.ip not in inplace_sites | dormant_sites],
+                 targets, caves, args.allow_relocate,
                  optimize=not args.no_dataflow,
-                 relocation_ranges=metadata['relocation_ranges'] + recovery.table_ranges,
+                 relocation_ranges=protected_ranges,
                  recovery=recovery)
+    original_runtime_audit = unwind.audit_runtime(elf, sites, go_metadata)
+    go_addresses = {item['address'] for item in original_runtime_audit['go_patch_sites']}
     before_grouping = len(sites)
     if args.regions:
-        sites = regions.group(sites, targets, metadata['relocation_ranges'] + recovery.table_ranges,
-                              recovery, weights=weights, allow_loads=args.region_loads)
+        # A Go module describes exact original frames. Native region fusion
+        # cannot silently change the frame/stack-map contract of Go sites.
+        native_sites = [s for s in sites if not any(i.ip in go_addresses for i in s.insns)]
+        go_sites = [s for s in sites if any(i.ip in go_addresses for i in s.insns)]
+        sites = regions.group(native_sites, targets, protected_ranges,
+                              recovery, weights=weights, allow_loads=args.region_loads) + go_sites
     if weights is not None:
         sites.sort(key=lambda site: (-max((weights.get(i.ip, 0) for i in site.insns), default=0), site.ip))
+    go_bodies, go_proofs, go_rejected = {}, {}, []
+    if args.go_runtime:
+        import go_lower
+        go_bodies, go_proofs, go_rejected = go_lower.prepare(sites, go_audit,
+                                                          allow_abi_borrow=not args.no_dataflow)
+        # Go's findfunc interval is contiguous and contains Go stubs only.
+        sites.sort(key=lambda s: s.ip in go_bodies)
     runtime_audit = unwind.audit_runtime(elf, sites, go_metadata)
-    if args.require_unwind and runtime_audit['strict_runtime_reasons']:
-        p.error('strict unwind gate: ' + '; '.join(runtime_audit['strict_runtime_reasons']))
+    runtime_audit['go_inplace_sites'] = sorted(inplace_sites)
+    runtime_audit['go_dispatch_sites'] = sorted(dormant_sites)
+    runtime_audit['go_registration_rejections'] = go_rejected
     planned = time.perf_counter()
     print(f'Lowering {len(sites)} sites...', flush=True)
     load_off = align(len(data))
     load_va = align(max(s['p_vaddr'] + s['p_memsz'] for s in elf.iter_segments() if s['p_type'] == 'PT_LOAD'))
     extra_header = int(args.unwind and not any(seg['p_type'] == 'PT_GNU_EH_FRAME' for seg in elf.iter_segments()))
-    code_off = align((elf['e_phnum'] + 1 + extra_header) * 56, 16)
-    unwind_result = None
+    code_off = align((elf['e_phnum'] + 1 + extra_header + bool(go_bodies)) * 56, 16)
+    unwind_result, go_result = None, None
+    go_metadata_va = go_installer_va = None
     with tempfile.TemporaryDirectory(prefix='static-penryn-') as temp:
         work = args.work_dir or Path(temp)
         work.mkdir(parents=True, exist_ok=True)
-        blob, syms = build_stubs(sites, load_va + code_off, work, args.core, region_loads=args.region_loads)
+        blob, syms = build_stubs(sites, load_va + code_off, work, args.core,
+                                 region_loads=args.region_loads, go_bodies=go_bodies)
+        registered_ranges = []
+        for n, site in enumerate(sites):
+            if site.ip in go_bodies:
+                start, end = syms[f'site_{n}'], syms[f'site_{n}_end']
+                code = bytes(blob[start-load_va-code_off:end-load_va-code_off])
+                go_lower.validate_emitted(code, start, constant_ranges=[
+                    (syms['_penryn_rodata_begin'], load_va+code_off+len(blob))])
+                registered_ranges.append(dict(start=start, end=end, original_pc=site.ip,
+                                              continuation=site.end, code=code))
         if args.unwind:
             ranges = []
             for n, site in enumerate(sites):
+                if site.ip in go_bodies:
+                    continue
                 if site.sequence:
                     ranges.append({'start': syms[f'site_{n}'], 'end': syms[f'site_{n}_end'],
                                    'original_pc': site.ip, 'kind': 'region'})
@@ -546,18 +653,79 @@ def main():
                         last = m + 1 == len(syms['_sequences'][n])
                         ranges.append({'start': syms[f'insn_{n}_{m}'],
                                        'end': syms[f'site_{n}_end'] if last else syms[f'insn_{n}_{m}_end'],
-                                       'original_pc': ins.ip, 'kind': 'lowered' if ins.mnemonic in FAMILIES else 'tail'})
+                                       'original_pc': ins.ip, 'kind': 'lowered' if ins.mnemonic in FAMILIES else 'tail',
+                                       'runtime': 'go' if site.ip in go_addresses else 'native'})
             unwind_result = unwind.build(elf, blob, load_va + code_off, ranges,
                                          load_va + code_off + align(len(blob), 8), work,
-                                         helper_elf=work / 'stubs.elf')
-            if args.require_unwind and unwind_result.report['uncovered_ranges']:
-                p.error(f"strict unwind gate: {len(unwind_result.report['uncovered_ranges'])} ranges lack native backtrace metadata")
+                                         helper_elf=work / 'stubs.elf', frame_recovery=frame_recovery)
+        if registered_ranges:
+            for attempt in range(4):
+                rx_end = align(len(blob), 8) + len(unwind_result.blob) if unwind_result is not None else len(blob)
+                go_installer_va = load_va + code_off + align(rx_end, 16)
+                if args.unwind and attempt == 0:
+                    # The first added initializer FDE grows the CFI stream.
+                    # Leave room before its temporary linker text section;
+                    # the following pass removes this provisional gap.
+                    go_installer_va += 4096
+                go_metadata_va = align(go_installer_va + 4096)
+                go_result = go_runtime.build(go_audit, registered_ranges, go_metadata_va, go_installer_va, work=work)
+                if not args.unwind:
+                    break
+                unwind_result = unwind.build(elf, blob, load_va + code_off, ranges,
+                    load_va + code_off + align(len(blob), 8), work,
+                    helper_elf=work / 'stubs.elf', frame_recovery=frame_recovery,
+                    extra_helpers=[(work/'go-init.elf', go_installer_va,
+                                    go_installer_va+len(go_result['constructor_bytes']), 'go_initializer')])
+                if go_installer_va == load_va + code_off + align(align(len(blob), 8)+len(unwind_result.blob), 16):
+                    break
+            else:
+                raise ValueError('Go initializer/native unwind layout failed to converge')
+        handled = set(go_bodies)
+        unhandled = [item for item in runtime_audit['go_patch_sites'] if item['address'] not in handled]
+        reasons = []
+        if go_metadata is None:
+            reasons.append('Go metadata was not audited')
+        elif go_metadata.get('go_build_version') and not go_metadata.get('tables'):
+            reasons.append('Go build information exists without a validated pclntab')
+        if go_audit is not None:
+            runtime_audit['go_candidate_provenance'] = go_audit.candidate_provenance
+            if any(item['classification'] != 'unreferenced-header-magic' for item in go_audit.candidate_provenance):
+                reasons.append('unresolved or referenced Go metadata candidates')
+        elif (go_metadata or {}).get('rejected_candidates'):
+            reasons.append('unresolved Go metadata candidates')
+        if unhandled:
+            reasons.append(f'{len(unhandled)} Go instruction sites still lack registered runtime metadata')
+        runtime_audit.update(known_go_sites_unhandled=len(unhandled), go_unhandled_sites=unhandled,
+                             go_registered_sites=sorted(handled), strict_runtime_reasons=reasons,
+                             go_registration=go_result['report'] if go_result else None,
+                             go_startup_patches=[dict(offset=item['offset'], original=item['old'].hex(),
+                                                      replacement=item['new'].hex())
+                                                for item in go_result['patches']] if go_result else [],
+                             go_lowering_proofs=list(go_proofs.values()),
+                             go_safepoints_supported=bool(go_result) and not unhandled,
+                             go_stack_growth_supported=bool(go_result) and not unhandled)
+        if (args.require_unwind or args.require_runtime) and reasons:
+            p.error('strict runtime gate: ' + '; '.join(reasons))
+        if args.require_unwind and unwind_result.report['uncovered_ranges']:
+            p.error(f"strict unwind gate: {len(unwind_result.report['uncovered_ranges'])} ranges lack native backtrace metadata")
     compiled = time.perf_counter()
-    result = rewrite(data, elf, sites, blob, syms, load_off, load_va, code_off, unwind_result)
+    result = rewrite(data, elf, sites, blob, syms, load_off, load_va, code_off, unwind_result,
+                     inplace=inplace, go_result=go_result,
+                     go_metadata_va=go_metadata_va, go_installer_va=go_installer_va)
     # Reparse and decode the patched executable, including emitted helper code.
-    remaining, _, _ = scan(ELFFile(io.BytesIO(result)), inventory_only=True)
-    if remaining:
-        raise ValueError(f'{len(remaining)} supported instructions remain after rewrite')
+    result_elf = ELFFile(io.BytesIO(result))
+    validate_elf(result, result_elf)
+    remaining, _, _ = scan(result_elf, inventory_only=True)
+    if {ins.ip for ins, _ in remaining} != dormant_sites:
+        raise ValueError('remaining supported instruction set differs from verified dormant paths')
+    for item in dormant:
+        off = va_offset(result_elf, item['address'])
+        if result[off:off+len(item['original_bytes'])] != item['original_bytes']:
+            raise ValueError('CPU-dispatch protected bytes changed during rewriting')
+    for a, b, sha in unchanged_functions:
+        off = va_offset(result_elf, a)
+        if digest(result[off:off+b-a]) != sha:
+            raise ValueError('a function supporting the Go in-place/dispatch proof changed during rewriting')
     verified = time.perf_counter()
     report = {
         'schema_version': 2,
@@ -573,6 +741,12 @@ def main():
         'runtime': runtime_audit,
         'unwind': unwind_result.report if unwind_result is not None else {'enabled': False},
         'added_unwind_bytes': len(unwind_result.blob) if unwind_result is not None else 0,
+        'added_go_metadata_bytes': len(go_result['blob']) if go_result else 0,
+        'go_runtime_enabled': args.go_runtime, 'go_inplace_enabled': args.go_inplace,
+        'go_dispatch_enabled': args.go_dispatch,
+        'dormant_instructions': [{**item, 'original_bytes': item['original_bytes'].hex()} for item in dormant],
+        'inplace_patches': [{key: value for key, value in item.items()
+                             if key not in ('original_bytes', 'replacement_bytes')} for item in inplace],
         'regions_enabled': args.regions, 'region_loads_enabled': args.region_loads,
         'fused_regions': sum(bool(s.sequence) for s in sites),
         'eliminated_site_jumps': before_grouping - len(sites),
@@ -582,7 +756,9 @@ def main():
         'sites_with_dead_xmms': sum(bool(h.dead_xmms) for s in sites for h in s.hints),
         'string_helpers': syms['_helper_report'],
         'helpers': [{**h, 'start': hex(h['start']), 'end': hex(h['end'])}
-                    for h in syms['_helper_ranges']],
+                    for h in syms['_helper_ranges']] +
+                   ([dict(name='go_initializer', start=hex(go_installer_va),
+                          end=hex(go_installer_va+len(go_result['constructor_bytes'])))] if go_result else []),
         'unscanned_rx_ranges': [{'address': hex(a), 'file_offset': off, 'bytes': size}
                                for a, off, size in metadata['uncovered_executable_ranges']],
         'timing_seconds': {'validate': validated - started, 'scan': scanned - validated,
@@ -592,7 +768,7 @@ def main():
         'experimental': True,
         'limitations': ['linear disassembly is not a proof of code/data boundaries',
                         'indirect entry points not exhaustively recovered',
-                        'Go safepoints, stack maps and stack-growth checks not relocated',
+                        'Go runtime coverage is limited to the explicitly reported registered or in-place contracts',
                         'native unwind coverage is partial and reported separately',
                         'original fault contexts and exception landing pads not remapped',
                         'JIT code and shared libraries not rewritten',
