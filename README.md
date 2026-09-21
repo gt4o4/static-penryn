@@ -10,11 +10,70 @@ core at `gt4o4/opemu-linux` revision
 Only arithmetic is reused, not the emulator's runtime machinery.
 
 **An experiment, not enabled in `penryn-overlays.nix`.** Both current
-applications pass the no-emulator startup tests below. General indirect
-control-flow recovery, fault-context equivalence and asynchronous unwinding
-remain unresolved. The host's kernel and installed packages are unchanged.
+applications pass the no-emulator tests below. Bounded control-flow recovery,
+profiling, shared regions and optional native unwind metadata are implemented.
+Go runtime metadata and complete indirect-entry/fault-context recovery remain
+unresolved; strict runtime mode refuses the affected applications.
 
-## Optimization pass, 2026-09-21
+## Profiling, regions and runtime pass, 2026-09-21
+
+- **Reproducible profiling:** `static-penryn workloads` creates independent
+  expected results for version/help, UTF-8 regex, Unicode properties and file
+  walking. `static-penryn profile` counts generated instructions with QEMU or
+  samples native execution with perf. Exact output hashes and byte checks
+  prevent attribution to the wrong binary. See [PROFILING.md](PROFILING.md).
+- **Profile-guided layout and fusion:** `--profile FILE` orders hot stubs
+  first. `--regions` joins bounded straight-line sequences and shares saves
+  of scratch registers unused throughout the region. The original arithmetic
+  lowerings are reused. Register-only glue is the default; `--region-loads`
+  separately permits ordinary read-only loads, whose fault context moves.
+  Profiles select candidates; they never prove safety or unreachability.
+- **Stronger recovery and liveness:** ELF symbols, native FDEs and Go function
+  metadata provide bounds. Guarded compiler-style relative jump tables add
+  protected entries and data spans: 357 tables in agy and 96 in Claude.
+  A compact instruction-boundary map lets bounded analysis follow verified
+  direct successors. Every successor must prove a value dead; loops, calls,
+  unknown entries, memory accesses and exhausted budgets stop the proof.
+  Full XMM death proofs now remove PCMPGTQ spills too.
+  Instruction starts use a bitmap; coalescing terminator padding and freezing
+  block boundaries into a compact array cuts agy's leader count from 5.47 to
+  2.81 million (22.45 MB), while preserving independently known entries.
+- **Runtime metadata and stress:** `--unwind` adds native CFI using original
+  frame rows and compiler helper CFI. `--require-unwind` refuses missing native
+  coverage or unresolved Go runtime metadata. Native timer-signal backtraces,
+  fault unwinding and a bounded Go GC/profiling fixture exercise these paths.
+  The Go fixture completes, but profiling exposes appended PCs as
+  `runtime._ExternalCode`; this remains a strict rejection, not a solved
+  safepoint/stack-growth problem. See [RUNTIME.md](RUNTIME.md).
+
+This pass reuses iced-x86, GCC/binutils, pyelftools, QEMU, perf and Go's
+standard library. [REUSE.md](REUSE.md) explains their roles and why using
+LLVM BOLT as a complete replacement is not justified for these inputs.
+
+The new full inputs still contain 1,500 and 1,729 supported instructions.
+Generated code plus constants shrank from 194,416 to **191,280 B** for agy
+and 156,736 to **154,112 B** for Claude with the recorded profiles and region
+options. Native unwind metadata adds separate bytes, reported by
+`added_unwind_bytes`; `added_payload_bytes` measures code plus constants.
+These sizes are not a runtime speedup measurement.
+
+All seven deterministic QEMU workloads pass on the new outputs. In Claude's
+hot four-POPCNT regex region, counting both original glue and appended stubs
+gives **104 → 86 guest instructions per iteration** (17.3% fewer), over
+43,213 iterations. Native whole-program timings and their limits are in
+[PROFILING.md](PROFILING.md).
+
+New validation includes **465,280** scalar/vector hardware comparisons and
+**31,000** shared-region hardware comparisons, with full live machine-state
+checks, plus **126** regression cases across ELF rewriting, dataflow/control
+flow, regions, integration, profiling and native runtime behavior. Commands
+are below. Earlier string arithmetic
+validation and initial benchmarks remain recorded in the following sections.
+Final experimental payloads are `/tmp/static-penryn-next/agy-profiled-final`
+and `claude-regions-final`, each with an adjacent JSON report. These retain
+partial native unwind coverage; they are not strict-mode-approved releases.
+
+## Initial optimization pass, 2026-09-21
 
 The lowerings support operand forms rather than application-specific byte
 patterns. This pass improves their execution cost and the rewriter's checks:
@@ -61,7 +120,7 @@ These measure replacement sequences; dormant CPU-dispatch paths and other
 application work limit whole-program gains. Faster fixed-work sequences
 also increase injected code size, especially CRC32C.
 
-## Application validation
+## Initial application validation
 
 | Input | POPCNT | CRC32 | PCMPGTQ | PCMPESTRI | Code + constants |
 |---|---:|---:|---:|---:|---:|
@@ -117,7 +176,7 @@ lines in a 200,000-line corpus; all variants also produce identical help
 and version output. These are startup/search tests, not authenticated
 sessions or a throughput guarantee.
 
-Current artifacts are in `/tmp/static-penryn-opt/`: `agy-final`,
+Initial-pass artifacts are in `/tmp/static-penryn-opt/`: `agy-final`,
 `claude-final`, their JSON patch reports and retained build directories,
 `qemu-validation.json`, TUI/help/search logs, `apps-benchmark.json`,
 `strings-benchmark.json`, and `sahf-both-bench/report.json` (scalar timings).
@@ -142,10 +201,11 @@ nix build --impure --expr '
 ' --out-link /tmp/static-penryn-tool --max-jobs 0
 ```
 
-The Nix package supplies the compiler, binutils, Python dependencies and
-pinned arithmetic source. Its build and a packaged-tool PIE fixture containing
-POPCNT, CRC32C, PCMPGTQ and PCMPESTRI passed on the Penryn model. It does not
-build the kernel/emulator. Alternatively:
+The Nix package supplies GCC/binutils, Python dependencies, QEMU, perf,
+GLib headers, the Go metadata helper and pinned arithmetic source.
+The final build, packaged PIE fixture containing POPCNT, CRC32C, PCMPGTQ
+and PCMPESTRI, exact Penryn profile and strict refusal checks pass. It does
+not build the kernel/emulator. Alternatively:
 
 ```sh
 python3 -m venv /tmp/static-penryn-venv
@@ -155,6 +215,8 @@ python3 -m venv /tmp/static-penryn-venv
 
 The Python route needs `cc` and `ld` on PATH and the pinned opemu checkout
 under `submodules/opemu-linux`; `--core /path/to/core` overrides that location.
+For Go-aware recovery and strict runtime auditing, build `go_metadata.go`
+and set `PENRYN_GOMETA` as described in [RUNTIME.md](RUNTIME.md).
 
 Pass the **payload ELF**, not its small launcher. For the measured versions:
 
@@ -169,6 +231,15 @@ claude=/nix/store/hmvhip68hbn4mshzblpji6634gzslh00-claude-code-2.1.278/bin/.clau
 # New files only. Existing input/output/report paths cannot be overwritten.
 "$tool" "$agy" /tmp/agy-static --allow-relocate
 "$tool" "$claude" /tmp/claude-static --allow-relocate
+
+# Gather exact workloads, then apply their counts to the ORIGINAL input.
+"$tool" workloads --agy /tmp/agy-static --claude /tmp/claude-static \
+  --work /tmp/penryn-workloads
+"$tool" "$claude" /tmp/claude-regions --allow-relocate --regions \
+  --region-loads --profile /tmp/penryn-workloads/claude-combined.json --unwind
+
+# Strict mode refuses both full apps until their runtime gaps are resolved.
+# --require-unwind is useful for supported native fixtures with complete CFI.
 
 # No global opemu toggle; these test guest instructions under TCG.
 ulimit -c 0
@@ -194,6 +265,9 @@ all replacement code. Original LOAD addresses, original sections and the
 into the added mapping; no NOTE or other loader metadata is sacrificed.
 The `.penryn` section contains only code; `.penryn.rodata` describes
 constants without the executable section flag. Their LOAD mapping is RX.
+`--unwind` additionally installs `.penryn.eh_frame` and
+`.penryn.eh_frame_hdr`, both without the executable section flag, and updates
+or adds `PT_GNU_EH_FRAME` while retaining original native frame records.
 
 Four-byte POPCNT cannot hold that JMP. The tool first tries a two-byte JMP
 to unused nearby padding after a terminating instruction, then a full JMP
@@ -207,6 +281,9 @@ absolute code pointers, RIP-relative address-taken entries and loader writes,
 and never moves CALL/interrupt/exception instructions. iced-x86 relocates
 the moved instruction, including branches and RIP-relative addressing.
 Some adjacent POPCNT pairs share a stub.
+`--regions` extends grouping to verified straight-line glue within recovered
+function or block bounds, at most 24 instructions and 96 original bytes.
+Known interior entries and protected loader/table bytes prohibit grouping.
 For the measured binaries, agy uses 28 caves and 17 moved tails; Claude
 uses 69 caves and 162 moved tails/pairs. Every site and original byte span
 is recorded in the JSON report beside the new ELF.
@@ -222,8 +299,9 @@ the patcher verifies it before publishing output.
 - Linear executable-section disassembly and known-entry checks cannot
   recover every indirect branch or distinguish arbitrary embedded data.
   `--allow-relocate` acknowledges this limitation; default mode refuses
-  missing caves. Relative jump tables and packed pointers remain examples
-  of unrecovered entries. Sectionless ELF files are refused. RX bytes
+  missing caves. Guarded compiler-style relative tables are recovered;
+  other indirect dispatch patterns and packed pointers remain incomplete.
+  Sectionless ELF files are refused. RX bytes
   outside executable sections are reported rather than decoded as code;
   agy's large RX metadata area is one such range. A new binary version
   needs renewed runtime validation.
@@ -234,12 +312,16 @@ the patcher verifies it before publishing output.
   the untouched 128-byte SysV red zone. Stack pages must exist, and an
   operand must not alias the new scratch area below that red zone.
   RSP/ESP/SP destinations and EIP-relative addressing are explicitly refused.
+  Fused regions add a shared frame; their conservative total bound is
+  `shared_frame.maximum_stack_bytes` (at most 376 B with current allocation).
+  Stack/frame-dependent glue, stores and control transfers cannot be grouped.
 - String helpers have an audited 512-byte stack budget, including the
   protected red zone; the full hardware harness observed a maximum of
   431 bytes. This is not a Go stack-growth check. agy's two string sites
   are behind its feature dispatcher on honest Penryn; do not assume they
   are safe on a tiny Go stack merely because startup works.
-- No DWARF/Go unwind or safepoint metadata is generated for appended code.
+- Optional native CFI covers supported frame rules, with gaps reported;
+  it does not relocate C++ landing pads or Go stack maps/safe points.
   Go refuses unknown PCs as async safe points, but faults/profilers/signals
   can observe a temporary stack/register state. Exact original fault PC
   and signal-context semantics are not preserved. Sustained real workloads
@@ -251,15 +333,22 @@ the patcher verifies it before publishing output.
 ```sh
 python=/tmp/static-penryn-venv/bin/python
 "$python" hosts/iMacGBC/static-penryn/test_dataflow.py
+"$python" hosts/iMacGBC/static-penryn/test_controlflow.py
+"$python" -m unittest discover -s hosts/iMacGBC/static-penryn -p test_regions.py
 "$python" hosts/iMacGBC/static-penryn/test_patch.py
+"$python" hosts/iMacGBC/static-penryn/test_integration.py
+"$python" hosts/iMacGBC/static-penryn/test_profile.py
+"$python" hosts/iMacGBC/static-penryn/test_runtime.py
 "$python" hosts/iMacGBC/static-penryn/test_lower.py --remote lix-ory
+"$python" hosts/iMacGBC/static-penryn/test_regions.py --remote lix-ory
 "$python" hosts/iMacGBC/static-penryn/test_strings.py --remote lix-ory
 ```
 
 In preservation mode, the differential harnesses compare all GPRs, XMM
 registers, architectural status flags, DF and red zone against hardware.
-Dataflow modes exclude the declared-dead GPRs and status flags from the
-comparison. The string test also checks all 256 control bytes, 32/64-bit
+Dataflow modes exclude the declared-dead GPRs, XMMs and status flags from the
+comparison; the shared-region oracle compares all registers without exclusions.
+The string test also checks all 256 control bytes, 32/64-bit
 signed length boundaries and unaligned memory. They use temporary test
 artifacts; no app credentials or kernel settings are changed.
 

@@ -92,7 +92,7 @@ def build_helpers(instructions, core, work):
     subprocess.run([
         "cc", "-O2", "-march=core2", "-mgeneral-regs-only", "-fPIC", "-ffreestanding",
         "-fno-stack-protector", "-mno-red-zone", "-ffunction-sections", "-fdata-sections",
-        "-fno-asynchronous-unwind-tables", "-fno-unwind-tables", "-fvisibility=hidden",
+        "-fasynchronous-unwind-tables", "-funwind-tables", "-fvisibility=hidden",
         "-fstack-usage", "-I" + str(core), "-c", str(source), "-o", str(obj),
     ], check=True)
     usages = {}

@@ -88,13 +88,14 @@ class Site:
     cave: int | None = None
     tail: object = None
     hints: list = field(default_factory=list)
+    sequence: list = field(default_factory=list)
 
     @property
     def ip(self):
         return self.insns[0].ip
 
 
-def scan(elf, *, inventory_only=False, metadata=None):
+def scan(elf, *, inventory_only=False, metadata=None, recovery=None):
     hits, targets, caves = [], {elf['e_entry']}, []
     if metadata:
         targets.update(metadata['pointer_targets'])
@@ -120,6 +121,8 @@ def scan(elf, *, inventory_only=False, metadata=None):
         padding = None
         previous_terminates = False
         for ins in Decoder(64, data, ip=sec['sh_addr']):
+            if recovery is not None:
+                recovery.feed(ins)
             flow = ins.flow_control
             mnemonic = ins.mnemonic
             if flow != FlowControl.NEXT and ins.op0_kind in (
@@ -152,10 +155,13 @@ def scan(elf, *, inventory_only=False, metadata=None):
                 hits.append((ins, sec))
         if padding is not None and sec['sh_addr'] + len(data) - padding >= 5:
             caves.append((padding, sec['sh_addr'] + len(data)))
+    if recovery is not None:
+        recovery.finish()
+        targets.update(recovery.targets)
     return hits, targets, caves
 
 
-def plan(elf, hits, targets, caves, allow_relocate, *, optimize=True, relocation_ranges=()):
+def plan(elf, hits, targets, caves, allow_relocate, *, optimize=True, relocation_ranges=(), recovery=None):
     used, plans, failures = set(), [], []
     section_data = {}
     # Do not steal a known entry point even when it is in padding.
@@ -227,7 +233,10 @@ def plan(elf, hits, targets, caves, allow_relocate, *, optimize=True, relocation
         for source in site.insns:
             start = source.next_ip - sec['sh_addr']
             continuation = Decoder(64, contents(sec)[start:start + 24 * 15], ip=source.next_ip)
-            site.hints.append(analyze(continuation) if optimize else Hints())
+            site.hints.append(analyze(continuation,
+                                     lookup=recovery.lookup if recovery is not None else None,
+                                     bounds=recovery.bounds(source.ip) if recovery is not None else None)
+                              if optimize else Hints())
         plans.append(site)
     if failures:
         raise ValueError(f'{len(failures)} unsafe sites; no output written:\n' + '\n'.join(failures[:30]))
@@ -269,21 +278,34 @@ def _relocate_tail(ins, address):
     return code
 
 
-def build_stubs(sites, address, work, core):
+def build_stubs(sites, address, work, core, *, region_loads=False):
     import lower
     import strings
-    bodies = []
+    import regions
+    sequences = [regions.sequence(site) for site in sites]
+    bodies, prefixes, suffixes, shared = [], [], [], []
     instructions = [i for site in sites for i in site.insns]
-    for site in sites:
-        body = []
-        for n, ins in enumerate(site.insns):
-            hint = site.hints[n] if site.hints else Hints()
-            if ins.mnemonic in lower.SUPPORTED:
-                body.append(lower.lower(ins, preserve_flags=hint.preserve_flags,
-                                        dead_registers=hint.dead_registers))
-            else:
-                body.append(strings.lower(ins))
-        bodies.append('\n'.join(body))
+    for site, steps in zip(sites, sequences):
+        hints = {ins.ip: site.hints[n] if site.hints else Hints()
+                 for n, ins in enumerate(site.insns)}
+        if site.sequence:
+            prefix, body, suffix, sharing = regions.shared_lowering(steps, hints, allow_loads=region_loads)
+        else:
+            prefix, suffix, sharing, body = [], [], {}, []
+            for ins in steps:
+                hint = hints.get(ins.ip, Hints())
+                if ins.mnemonic in lower.SUPPORTED:
+                    body.append(lower.lower(ins, preserve_flags=hint.preserve_flags,
+                                            dead_registers=hint.dead_registers,
+                                            dead_xmms=hint.dead_xmms))
+                elif ins.mnemonic in strings.SUPPORTED:
+                    body.append(strings.lower(ins))
+                else:
+                    body.append(None)
+        bodies.append(body)
+        prefixes.append(prefix)
+        suffixes.append(suffix)
+        shared.append(sharing)
     objects = [work / 'stubs.o']
     helper_report = {}
     if any(i.mnemonic in strings.SUPPORTED for i in instructions):
@@ -292,8 +314,8 @@ def build_stubs(sites, address, work, core):
                 raise ValueError(f'{filename} differs from the validated 6641be6 core')
         obj, helper_report = strings.build_helpers(instructions, core, work)
         objects.append(obj)
-    # Text and tables share an RX mapping but get distinct ELF sections.
-    # A CRC table is data even when executable at the hardware page level.
+    # Keep GCC's helper CFI in the intermediate ELF for the optional unwind
+    # writer. Only .patch bytes become the executable payload at this stage.
     (work / 'layout.ld').write_text(f'''SECTIONS {{
       . = {address};
       .patch {address} : {{
@@ -303,44 +325,63 @@ def build_stubs(sites, address, work, core):
         _penryn_rodata_begin = .;
         *(.rodata*)
       }}
-      /DISCARD/ : {{ *(.eh_frame*) *(.comment) *(.note*) }}
+      .eh_frame : {{ KEEP(*(.eh_frame*)) }}
+      /DISCARD/ : {{ *(.comment) *(.note*) }}
     }}\n''')
-    tail_sizes = {n: 32 for n, s in enumerate(sites) if s.tail is not None}
+    moved_sizes = {(n, m): 32 for n, body in enumerate(bodies)
+                   for m, text in enumerate(body) if text is None}
     for attempt in range(4):
         asm = ['.intel_syntax noprefix', '.text']
         for n, site in enumerate(sites):
-            asm += [f'.global site_{n}', f'site_{n}:', bodies[n]]
-            if site.tail is not None:
-                asm += [f'.global tail_{n}', f'tail_{n}:', f'.fill {tail_sizes[n]}, 1, 0x90']
+            asm += [f'.global site_{n}', f'site_{n}:', *prefixes[n]]
+            for m, body in enumerate(bodies[n]):
+                asm += [f'.global insn_{n}_{m}', f'insn_{n}_{m}:']
+                if body is None:
+                    if sequences[n][m] is site.tail:
+                        asm += [f'.global tail_{n}', f'tail_{n}:']
+                    asm += [f'.fill {moved_sizes[n, m]}, 1, 0x90']
+                else:
+                    asm.append(body)
+                asm += [f'.global insn_{n}_{m}_end', f'insn_{n}_{m}_end:']
+            asm += suffixes[n]
             asm += ['.byte 0xe9', '.long 0', f'.reloc .-4, R_X86_64_PC32, {site.end}-4']
+            asm += [f'.global site_{n}_end', f'site_{n}_end:']
         asm += [lower.support_assembly(), '.section .note.GNU-stack,"",@progbits']
         (work / 'stubs.S').write_text('\n'.join(asm) + '\n')
         run('cc', '-c', '-o', work / 'stubs.o', work / 'stubs.S')
         run('ld', '--gc-sections', '-T', work / 'layout.ld', '-o', work / 'stubs.elf', *objects)
         with (work / 'stubs.elf').open('rb') as f:
             stubelf = ELFFile(f)
-            syms = {s.name: s['st_value'] for s in stubelf.get_section_by_name('.symtab').iter_symbols()}
+            symbols = list(stubelf.get_section_by_name('.symtab').iter_symbols())
+            syms = {s.name: s['st_value'] for s in symbols}
+            helpers = [{'name': s.name, 'start': s['st_value'],
+                        'end': s['st_value'] + s['st_size']}
+                       for s in symbols if s['st_info']['type'] == 'STT_FUNC'
+                       and s.name.startswith('penryn_pcmp_') and s['st_size']]
             sec = stubelf.get_section_by_name('.patch')
             if sec['sh_addr'] != address:
                 raise ValueError('linker moved the injected section from its requested address')
             blob = bytearray(sec.data())
             for s in stubelf.iter_sections():
-                if s['sh_flags'] & 2 and s.name != '.patch' and s['sh_size']:
+                if s['sh_flags'] & 2 and s.name not in ('.patch', '.eh_frame') and s['sh_size']:
                     raise ValueError(f'unexpected allocated helper section {s.name}')
-        moved = {n: _relocate_tail(s.tail, syms[f'tail_{n}'])
-                 for n, s in enumerate(sites) if s.tail is not None}
-        sizes = {n: len(code) for n, code in moved.items()}
-        if sizes == tail_sizes:
-            for n, code in moved.items():
-                offset = syms[f'tail_{n}'] - address
+        moved = {(n, m): _relocate_tail(sequences[n][m], syms[f'insn_{n}_{m}'])
+                 for n, m in moved_sizes}
+        sizes = {key: len(code) for key, code in moved.items()}
+        if sizes == moved_sizes:
+            for (n, m), code in moved.items():
+                offset = syms[f'insn_{n}_{m}'] - address
                 blob[offset:offset + len(code)] = code
             syms['_helper_report'] = helper_report
+            syms['_helper_ranges'] = sorted(helpers, key=lambda h: h['start'])
+            syms['_shared_frames'] = shared
+            syms['_sequences'] = sequences
             return blob, syms
-        tail_sizes = sizes
+        moved_sizes = sizes
     raise ValueError('relocated instruction layout failed to converge')
 
 
-def rewrite(data, elf, sites, blob, syms, load_off, load_va, code_off):
+def rewrite(data, elf, sites, blob, syms, load_off, load_va, code_off, unwind_result=None):
     result = bytearray(data)
     for n, s in enumerate(sites):
         dest = syms[f'site_{n}']
@@ -351,44 +392,66 @@ def rewrite(data, elf, sites, blob, syms, load_off, load_va, code_off):
             off = va_offset(elf, s.cave)
             result[off:off + 5] = jump(s.cave, dest)
         result[s.offset:s.offset + s.end - s.ip] = patch + b'\x90' * (s.end - s.ip - len(patch))
-    phoff, phnum = elf['e_phoff'], elf['e_phnum']
-    headers = bytearray(data[phoff:phoff + phnum * 56])
-    size = code_off + len(blob)
-    # Relocate the PHDR table into the new mapping. No NOTE or other loader
-    # metadata is sacrificed. Preserve every original LOAD's offset/address.
-    for n in range(phnum):
-        if struct.unpack_from('<I', headers, n * 56)[0] == 6:  # PT_PHDR
+    payload = bytearray(blob)
+    metadata_offset = align(len(payload), 8)
+    if unwind_result is not None:
+        payload += bytes(metadata_offset - len(payload)) + unwind_result.blob
+    phoff, old_phnum = elf['e_phoff'], elf['e_phnum']
+    headers = bytearray(data[phoff:phoff + old_phnum * 56])
+    has_eh_header = any(seg['p_type'] == 'PT_GNU_EH_FRAME' for seg in elf.iter_segments())
+    phnum = old_phnum + 1 + int(unwind_result is not None and not has_eh_header)
+    if phnum >= 65535 or code_off < phnum * 56:
+        raise ValueError('insufficient space for new program headers')
+    for n in range(old_phnum):
+        kind = struct.unpack_from('<I', headers, n * 56)[0]
+        if kind == 6:  # PT_PHDR
             struct.pack_into('<IIQQQQQQ', headers, n * 56, 6, 4, load_off, load_va,
-                             load_va, (phnum + 1) * 56, (phnum + 1) * 56, 8)
+                             load_va, phnum * 56, phnum * 56, 8)
+        elif kind == 0x6474e550 and unwind_result is not None:
+            address = unwind_result.header_address
+            struct.pack_into('<IIQQQQQQ', headers, n * 56, kind, 4,
+                             load_off + address - load_va, address, address,
+                             unwind_result.header_size, unwind_result.header_size, 4)
+    size = code_off + len(payload)
     headers += struct.pack('<IIQQQQQQ', 1, 5, load_off, load_va, load_va, size, size, 4096)
-    result += b'\0' * (load_off - len(result))
-    result += headers + b'\0' * (code_off - len(headers)) + blob
+    if unwind_result is not None and not has_eh_header:
+        address = unwind_result.header_address
+        headers += struct.pack('<IIQQQQQQ', 0x6474e550, 4, load_off + address - load_va,
+                               address, address, unwind_result.header_size, unwind_result.header_size, 4)
+    result += bytes(load_off - len(result))
+    result += headers + bytes(code_off - len(headers)) + payload
     struct.pack_into('<Q', result, 32, load_off)
-    struct.pack_into('<H', result, 56, phnum + 1)
-    # Advertise added code for disassemblers without touching original sections.
-    old_names = elf.get_section(elf['e_shstrndx']).data()
-    names_off = len(result)
-    extra_names = b'.penryn\0.penryn.rodata\0'
-    result += old_names + extra_names
-    shoff = align(len(result), 8)
-    result += b'\0' * (shoff - len(result))
-    old_shoff, shnum = elf['e_shoff'], elf['e_shnum']
-    shdrs = bytearray(data[old_shoff:old_shoff + shnum * 64])
-    struct.pack_into('<QQ', shdrs, elf['e_shstrndx'] * 64 + 24, names_off, len(old_names) + len(extra_names))
+    struct.pack_into('<H', result, 56, phnum)
     address = load_va + code_off
     code_size = syms['_penryn_code_end'] - address
     rodata_offset = syms['_penryn_rodata_begin'] - address
-    shdrs += struct.pack('<IIQQQQIIQQ', len(old_names), 1, 6, load_va + code_off,
-                         load_off + code_off, code_size, 0, 0, 16, 0)
-    added_sections = 1
+    extra_sections = [{'name': '.penryn', 'offset': 0, 'size': code_size, 'flags': 6, 'alignment': 16}]
     if len(blob) > rodata_offset:
-        shdrs += struct.pack('<IIQQQQIIQQ', len(old_names) + 8, 1, 2,
-                             address + rodata_offset, load_off + code_off + rodata_offset,
-                             len(blob) - rodata_offset, 0, 0, 64, 0)
-        added_sections += 1
+        extra_sections.append({'name': '.penryn.rodata', 'offset': rodata_offset,
+                               'size': len(blob) - rodata_offset, 'flags': 2, 'alignment': 64})
+    if unwind_result is not None:
+        extra_sections += [{**sec, 'offset': metadata_offset + sec['offset'], 'flags': 2}
+                           for sec in unwind_result.sections]
+    old_shoff, shnum = elf['e_shoff'], elf['e_shnum']
+    if shnum + len(extra_sections) >= 65280:
+        raise ValueError('new section count requires unsupported extended ELF numbering')
+    names = bytearray(elf.get_section(elf['e_shstrndx']).data())
+    for sec in extra_sections:
+        sec['name_offset'] = len(names)
+        names += sec['name'].encode() + b'\0'
+    names_off = len(result)
+    result += names
+    shoff = align(len(result), 8)
+    result += bytes(shoff - len(result))
+    shdrs = bytearray(data[old_shoff:old_shoff + shnum * 64])
+    struct.pack_into('<QQ', shdrs, elf['e_shstrndx'] * 64 + 24, names_off, len(names))
+    for sec in extra_sections:
+        shdrs += struct.pack('<IIQQQQIIQQ', sec['name_offset'], 1, sec['flags'],
+                             address + sec['offset'], load_off + code_off + sec['offset'],
+                             sec['size'], 0, 0, sec['alignment'], 0)
     result += shdrs
     struct.pack_into('<Q', result, 40, shoff)
-    struct.pack_into('<H', result, 60, shnum + added_sections)
+    struct.pack_into('<H', result, 60, shnum + len(extra_sections))
     return result
 
 
@@ -398,10 +461,20 @@ def main():
     p.add_argument('output', type=Path, nargs='?')
     p.add_argument('--report', type=Path)
     p.add_argument('--no-dataflow', action='store_true', help='preserve all original registers and flags at every replacement boundary')
+    p.add_argument('--profile', type=Path, help='exact-input QEMU execution profile for hot-first layout and region selection')
+    p.add_argument('--regions', action='store_true', help='group bounded straight-line sites; requires --allow-relocate')
+    p.add_argument('--region-loads', action='store_true', help='also relocate read-only load glue in regions; original fault contexts are not preserved')
+    p.add_argument('--unwind', action='store_true', help='emit native backtrace metadata with explicit coverage gaps')
+    p.add_argument('--require-unwind', action='store_true', help='require complete native unwind coverage and audited absence of patched Go code')
     p.add_argument('--allow-relocate', action='store_true', help='experimental: borrow next instruction at short sites; known entry points protected, indirect entries not proven')
     p.add_argument('--core', type=Path, default=HERE.parents[2] / 'submodules/opemu-linux/core')
     p.add_argument('--work-dir', type=Path, help='retain generated assembly and linked helpers')
     args = p.parse_args()
+    args.unwind |= args.require_unwind
+    if args.regions and not args.allow_relocate:
+        p.error('--regions requires --allow-relocate')
+    if args.region_loads and not args.regions:
+        p.error('--region-loads requires --regions')
     started = time.perf_counter()
     if args.output is not None:
         if args.output.exists() or args.output.is_symlink():
@@ -419,8 +492,18 @@ def main():
     if elf.get_section_by_name('.penryn'):
         p.error('input already patched')
     validated = time.perf_counter()
+    import regions
+    import unwind
+    from controlflow import Recovery
+    weights = regions.read_profile(args.profile, digest(data)) if args.profile else None
+    go_metadata = unwind.load_go_metadata(args.input)
+    functions = [(f['start'], f['end'], f['name']) for table in (go_metadata or {}).get('tables', [])
+                 for f in table['functions']]
+    recovery = Recovery(elf)
+    recovery.add_functions(functions, source='go')
     print('Decoding executable sections...', flush=True)
-    hits, targets, caves = scan(elf, metadata=metadata)
+    hits, targets, caves = scan(elf, metadata=metadata, recovery=recovery)
+    cfg_report = recovery.finish()
     scanned = time.perf_counter()
     counts = Counter(FAMILIES[i.mnemonic] for i, _ in hits)
     print(json.dumps(dict(counts), sort_keys=True), flush=True)
@@ -429,24 +512,55 @@ def main():
     if not hits:
         p.error('no supported instructions found')
     sites = plan(elf, hits, targets, caves, args.allow_relocate,
-                 optimize=not args.no_dataflow, relocation_ranges=metadata['relocation_ranges'])
+                 optimize=not args.no_dataflow,
+                 relocation_ranges=metadata['relocation_ranges'] + recovery.table_ranges,
+                 recovery=recovery)
+    before_grouping = len(sites)
+    if args.regions:
+        sites = regions.group(sites, targets, metadata['relocation_ranges'] + recovery.table_ranges,
+                              recovery, weights=weights, allow_loads=args.region_loads)
+    if weights is not None:
+        sites.sort(key=lambda site: (-max((weights.get(i.ip, 0) for i in site.insns), default=0), site.ip))
+    runtime_audit = unwind.audit_runtime(elf, sites, go_metadata)
+    if args.require_unwind and runtime_audit['strict_runtime_reasons']:
+        p.error('strict unwind gate: ' + '; '.join(runtime_audit['strict_runtime_reasons']))
     planned = time.perf_counter()
     print(f'Lowering {len(sites)} sites...', flush=True)
     load_off = align(len(data))
     load_va = align(max(s['p_vaddr'] + s['p_memsz'] for s in elf.iter_segments() if s['p_type'] == 'PT_LOAD'))
-    code_off = align((elf['e_phnum'] + 1) * 56, 16)
+    extra_header = int(args.unwind and not any(seg['p_type'] == 'PT_GNU_EH_FRAME' for seg in elf.iter_segments()))
+    code_off = align((elf['e_phnum'] + 1 + extra_header) * 56, 16)
+    unwind_result = None
     with tempfile.TemporaryDirectory(prefix='static-penryn-') as temp:
         work = args.work_dir or Path(temp)
         work.mkdir(parents=True, exist_ok=True)
-        blob, syms = build_stubs(sites, load_va + code_off, work, args.core)
+        blob, syms = build_stubs(sites, load_va + code_off, work, args.core, region_loads=args.region_loads)
+        if args.unwind:
+            ranges = []
+            for n, site in enumerate(sites):
+                if site.sequence:
+                    ranges.append({'start': syms[f'site_{n}'], 'end': syms[f'site_{n}_end'],
+                                   'original_pc': site.ip, 'kind': 'region'})
+                else:
+                    for m, ins in enumerate(syms['_sequences'][n]):
+                        last = m + 1 == len(syms['_sequences'][n])
+                        ranges.append({'start': syms[f'insn_{n}_{m}'],
+                                       'end': syms[f'site_{n}_end'] if last else syms[f'insn_{n}_{m}_end'],
+                                       'original_pc': ins.ip, 'kind': 'lowered' if ins.mnemonic in FAMILIES else 'tail'})
+            unwind_result = unwind.build(elf, blob, load_va + code_off, ranges,
+                                         load_va + code_off + align(len(blob), 8), work,
+                                         helper_elf=work / 'stubs.elf')
+            if args.require_unwind and unwind_result.report['uncovered_ranges']:
+                p.error(f"strict unwind gate: {len(unwind_result.report['uncovered_ranges'])} ranges lack native backtrace metadata")
     compiled = time.perf_counter()
-    result = rewrite(data, elf, sites, blob, syms, load_off, load_va, code_off)
+    result = rewrite(data, elf, sites, blob, syms, load_off, load_va, code_off, unwind_result)
     # Reparse and decode the patched executable, including emitted helper code.
     remaining, _, _ = scan(ELFFile(io.BytesIO(result)), inventory_only=True)
     if remaining:
         raise ValueError(f'{len(remaining)} supported instructions remain after rewrite')
     verified = time.perf_counter()
     report = {
+        'schema_version': 2,
         'input': str(args.input), 'input_sha256': digest(data),
         'output': str(args.output), 'output_sha256': digest(result),
         'families': dict(counts), 'sites': len(sites),
@@ -455,9 +569,20 @@ def main():
         'added_code_bytes': syms['_penryn_code_end'] - (load_va + code_off),
         'added_payload_bytes': len(blob), 'remaining_decoded_supported': len(remaining),
         'dataflow_enabled': not args.no_dataflow,
+        'control_flow': cfg_report,
+        'runtime': runtime_audit,
+        'unwind': unwind_result.report if unwind_result is not None else {'enabled': False},
+        'added_unwind_bytes': len(unwind_result.blob) if unwind_result is not None else 0,
+        'regions_enabled': args.regions, 'region_loads_enabled': args.region_loads,
+        'fused_regions': sum(bool(s.sequence) for s in sites),
+        'eliminated_site_jumps': before_grouping - len(sites),
+        'profile': str(args.profile) if args.profile else None,
         'flags_proven_dead': sum(not h.preserve_flags for s in sites for h in s.hints),
         'sites_with_dead_gprs': sum(bool(h.dead_registers) for s in sites for h in s.hints),
+        'sites_with_dead_xmms': sum(bool(h.dead_xmms) for s in sites for h in s.hints),
         'string_helpers': syms['_helper_report'],
+        'helpers': [{**h, 'start': hex(h['start']), 'end': hex(h['end'])}
+                    for h in syms['_helper_ranges']],
         'unscanned_rx_ranges': [{'address': hex(a), 'file_offset': off, 'bytes': size}
                                for a, off, size in metadata['uncovered_executable_ranges']],
         'timing_seconds': {'validate': validated - started, 'scan': scanned - validated,
@@ -467,16 +592,27 @@ def main():
         'experimental': True,
         'limitations': ['linear disassembly is not a proof of code/data boundaries',
                         'indirect entry points not exhaustively recovered',
-                        'no new Go/ELF unwind metadata',
+                        'Go safepoints, stack maps and stack-growth checks not relocated',
+                        'native unwind coverage is partial and reported separately',
+                        'original fault contexts and exception landing pads not remapped',
                         'JIT code and shared libraries not rewritten',
                         'AVX/AES/BMI remain behind original CPU dispatch'],
-        'patches': [{'address': hex(s.ip), 'original': data[s.offset:s.offset+s.end-s.ip].hex(),
+        'patches': [{'address': hex(s.ip), 'end': hex(s.end),
+                     'original': data[s.offset:s.offset+s.end-s.ip].hex(),
                      'stub': hex(syms[f'site_{n}']),
+                     'stub_end': hex(syms[f'site_{n}_end']),
+                     'instruction_ranges': [
+                         {'original_address': hex(ins.ip), 'start': hex(syms[f'insn_{n}_{m}']),
+                          'end': hex(syms[f'insn_{n}_{m}_end']),
+                          'mnemonic': FAMILIES.get(ins.mnemonic, str(ins).split()[0].upper())}
+                         for m, ins in enumerate(syms['_sequences'][n])],
                      'cave': hex(s.cave) if s.cave is not None else None,
                      'instructions': [str(i) for i in s.insns],
                      'tail': str(s.tail) if s.tail is not None else None,
+                     'region': bool(s.sequence), 'shared_frame': syms['_shared_frames'][n],
                      'optimization': [{'preserve_flags': h.preserve_flags,
-                                       'dead_registers': [REGISTER_NAMES[r] for r in sorted(h.dead_registers)]}
+                                       'dead_registers': [REGISTER_NAMES[r] for r in sorted(h.dead_registers)],
+                                       'dead_xmms': [REGISTER_NAMES[r] for r in sorted(h.dead_xmms)]}
                                       for h in s.hints]}
                     for n, s in enumerate(sites)]
     }

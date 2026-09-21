@@ -4,8 +4,8 @@ The caller emits Intel-syntax GAS and appends a jump to the continuation.
 No register is reserved by the trampoline.  All stack writes are below the
 original 128-byte SysV red zone.  As with any stack-using instrumentation,
 the input must not alias the new scratch area below that red zone; the
-additional stack must be mapped.  Async unwinding through a stub is not
-supported.  MAX_STACK_BYTES includes the protected red zone.
+additional stack must be mapped. Optional native unwind metadata is generated
+separately by unwind.py. MAX_STACK_BYTES includes the protected red zone.
 
 RIP memory loads deliberately use an explicit PC-relative relocation: GAS
 silently treats an already-defined absolute .set symbol as a displacement.
@@ -278,7 +278,7 @@ def _crc32(ins, preserve_flags, dead_registers):
     return lines + _epilogue(saved, False)
 
 
-def _pcmpgtq(ins, preserve_flags, dead_registers):
+def _pcmpgtq(ins, preserve_flags, dead_registers, dead_xmms=frozenset()):
     if ins.op0_kind != ix.OpKind.REGISTER or not ix.RegisterExt.is_xmm(ins.op0_register):
         raise LoweringError("expected an XMM destination")
     if _source_size(ins) != 16:
@@ -288,12 +288,15 @@ def _pcmpgtq(ins, preserve_flags, dead_registers):
         return [f"pxor {destination}, {destination}"]
     excluded = {ins.op0_register, ins.op1_register}
     count = 3 if ins.op1_kind == ix.OpKind.MEMORY else 2
-    scratch = [reg_name(r) for r in range(ix.Register.XMM0, ix.Register.XMM15 + 1)
-               if r not in excluded][:count]
+    candidates = sorted((r for r in range(ix.Register.XMM0, ix.Register.XMM15 + 1)
+                         if r not in excluded), key=lambda r: r not in dead_xmms)
+    scratch_regs = candidates[:count]
+    scratch = [reg_name(r) for r in scratch_regs]
+    saved = [reg_name(r) for r in scratch_regs if r not in dead_xmms]
     difference, equal = scratch[:2]
-    stack_delta = 128 + 16 * count
-    lines = [f"lea rsp, [rsp - {stack_delta}]"]
-    lines += [f"movdqu XMMWORD PTR [rsp + {i * 16}], {r}" for i, r in enumerate(scratch)]
+    stack_delta = 128 + 16 * len(saved) if saved else 0
+    lines = [f"lea rsp, [rsp - {stack_delta}]"] if stack_delta else []
+    lines += [f"movdqu XMMWORD PTR [rsp + {i * 16}], {r}" for i, r in enumerate(saved)]
     if ins.op1_kind == ix.OpKind.MEMORY:
         source = scratch[2]
         # Legacy PCMPGTQ memory requires 16-byte alignment; preserve that fault.
@@ -307,8 +310,8 @@ def _pcmpgtq(ins, preserve_flags, dead_registers):
               f"pcmpeqd {equal}, {source}", f"pcmpgtd {destination}, {source}",
               f"pand {difference}, {equal}", f"por {destination}, {difference}",
               f"pshufd {destination}, {destination}, 0xf5"]
-    lines += [f"movdqu {r}, XMMWORD PTR [rsp + {i * 16}]" for i, r in enumerate(scratch)]
-    return lines + [f"lea rsp, [rsp + {stack_delta}]"]
+    lines += [f"movdqu {r}, XMMWORD PTR [rsp + {i * 16}]" for i, r in enumerate(saved)]
+    return lines + ([f"lea rsp, [rsp + {stack_delta}]"] if stack_delta else [])
 
 
 def support_assembly():
@@ -334,7 +337,7 @@ def support_assembly():
     return "\n".join(lines) + "\n"
 
 
-def lower(ins, *, preserve_flags=True, dead_registers=frozenset()):
+def lower(ins, *, preserve_flags=True, dead_registers=frozenset(), dead_xmms=frozenset()):
     """Return leaf Intel-syntax GAS, excluding header and continuation jump.
 
     Defaults preserve every non-output register and architecturally specified
@@ -348,8 +351,12 @@ def lower(ins, *, preserve_flags=True, dead_registers=frozenset()):
         raise LoweringError("preserve_flags must be boolean")
     if any(r not in _WIDTH_NAMES or r == ix.Register.RSP for r in dead_registers):
         raise LoweringError("dead_registers must contain full non-stack GPRs")
+    if any(not ix.Register.XMM0 <= r <= ix.Register.XMM15 for r in dead_xmms):
+        raise LoweringError("dead_xmms must contain legacy XMM0..XMM15 registers")
     implementation = {ix.Mnemonic.POPCNT: _popcnt, ix.Mnemonic.CRC32: _crc32,
                       ix.Mnemonic.PCMPGTQ: _pcmpgtq}.get(ins.mnemonic)
     if implementation is None:
         raise LoweringError(f"unsupported instruction: {_FORMATTER.format(ins)}")
+    if ins.mnemonic == ix.Mnemonic.PCMPGTQ:
+        return "\n".join(_pcmpgtq(ins, preserve_flags, dead_registers, dead_xmms)) + "\n"
     return "\n".join(implementation(ins, preserve_flags, dead_registers)) + "\n"

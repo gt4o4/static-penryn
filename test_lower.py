@@ -70,6 +70,36 @@ def worker(library, iterations):
           "live GPRs/status flags, DF, 16 XMM registers and 128-byte red zone compared")
 
 
+
+def state_wrapper(name, body):
+    names = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi"] + [f"r{i}" for i in range(8, 16)]
+    lines = [f".global {name}", f".type {name}, @function", f"{name}:"]
+    for register in ("rbx", "rbp", "r12", "r13", "r14", "r15"):
+        lines.append(f"push {register}")
+    lines += ["sub rsp, 2056", "lea rsp, [rsp + 1024]", "mov [rsp + 768], rdi", "mov [rsp + 776], rsi"]
+    # Fill the red zone before any target registers or flags are loaded.
+    for k in range(16):
+        lines += [f"mov rax, [rdi + {392 + k * 8}]", f"mov [rsp - {128 - k * 8}], rax"]
+    for k in range(16):
+        lines.append(f"movdqu xmm{k}, XMMWORD PTR [rdi + {136 + k * 16}]")
+    lines += ["lea rsp, [rsp - 128]", "push QWORD PTR [rdi + 128]", "popfq", "lea rsp, [rsp + 128]", "mov rdx, rdi"]
+    for k, register in enumerate(names):
+        if register not in ("rsp", "rdx"):
+            lines.append(f"mov {register}, [rdx + {k * 8}]")
+    lines += ["mov rdx, [rdx + 16]", body]
+    for k, register in enumerate(names):
+        lines.append(f"mov [rsp + {k * 8}], {register}")
+    lines += ["lea rsp, [rsp - 128]", "pushfq", "pop QWORD PTR [rsp + 256]", "lea rsp, [rsp + 128]"]
+    for k in range(16):
+        lines.append(f"movdqu XMMWORD PTR [rsp + {136 + k * 16}], xmm{k}")
+    for k in range(16):
+        lines += [f"mov rax, [rsp - {128 - k * 8}]", f"mov [rsp + {392 + k * 8}], rax"]
+    lines += ["cld", "mov rdi, [rsp + 776]", "mov rsi, rsp", "mov ecx, 65", "rep movsq", "lea rsp, [rsp + 1032]"]
+    for register in ("r15", "r14", "r13", "r12", "rbp", "rbx"):
+        lines.append(f"pop {register}")
+    return "\n".join(lines + ["ret", f".size {name}, .-{name}"]) + "\n"
+
+
 def generate(directory):
     import iced_x86 as ix
     import lower
@@ -129,48 +159,31 @@ def generate(directory):
         ]:
             add(ix.Instruction.create_reg_mem(ix.Code.PCMPGTQ_XMM_XMMM128, destination, operand), mode)
 
-    def wrapper(name, body):
-        lines = [f".global {name}", f".type {name}, @function", f"{name}:"]
-        for register in ("rbx", "rbp", "r12", "r13", "r14", "r15"):
-            lines.append(f"push {register}")
-        lines += ["sub rsp, 2056", "lea rsp, [rsp + 1024]", "mov [rsp + 768], rdi", "mov [rsp + 776], rsi"]
-        # Fill the red zone before any target registers or flags are loaded.
-        for k in range(16):
-            lines += [f"mov rax, [rdi + {392 + k * 8}]", f"mov [rsp - {128 - k * 8}], rax"]
-        for k in range(16):
-            lines.append(f"movdqu xmm{k}, XMMWORD PTR [rdi + {136 + k * 16}]")
-        lines += ["lea rsp, [rsp - 128]", "push QWORD PTR [rdi + 128]", "popfq", "lea rsp, [rsp + 128]", "mov rdx, rdi"]
-        for k, register in enumerate(names):
-            if register not in ("rsp", "rdx"):
-                lines.append(f"mov {register}, [rdx + {k * 8}]")
-        lines += ["mov rdx, [rdx + 16]", body]
-        for k, register in enumerate(names):
-            lines.append(f"mov [rsp + {k * 8}], {register}")
-        lines += ["lea rsp, [rsp - 128]", "pushfq", "pop QWORD PTR [rsp + 256]", "lea rsp, [rsp + 128]"]
-        for k in range(16):
-            lines.append(f"movdqu XMMWORD PTR [rsp + {136 + k * 16}], xmm{k}")
-        for k in range(16):
-            lines += [f"mov rax, [rsp - {128 - k * 8}]", f"mov [rsp + {392 + k * 8}], rax"]
-        lines += ["cld", "mov rdi, [rsp + 776]", "mov rsi, rsp", "mov ecx, 65", "rep movsq", "lea rsp, [rsp + 1032]"]
-        for register in ("r15", "r14", "r13", "r12", "rbp", "rbx"):
-            lines.append(f"pop {register}")
-        return "\n".join(lines + ["ret", f".size {name}, .-{name}"]) + "\n"
+    wrapper = state_wrapper
 
     assembly = [".intel_syntax noprefix\n.text\n"]
     manifest = []
     dead = frozenset(r for r in registers if r != ix.Register.RSP)
     variants = [(True, frozenset()), (False, frozenset()), (True, dead), (False, dead)]
-    for index, (ins, mode, preserve_flags, dead_registers) in enumerate(
-            (ins, mode, flags, dead) for ins, mode in cases for flags, dead in variants):
+    all_xmms = frozenset(range(ix.Register.XMM0, ix.Register.XMM15 + 1))
+    configurations = [(ins, mode, flags, dead, frozenset())
+                      for ins, mode in cases for flags, dead in variants]
+    configurations += [(ins, mode, flags, dead_regs, all_xmms)
+                       for ins, mode in cases if ins.mnemonic == ix.Mnemonic.PCMPGTQ
+                       for flags, dead_regs in ((True, frozenset()), (False, dead))]
+    for index, (ins, mode, preserve_flags, dead_registers, dead_xmms) in enumerate(configurations):
         if ins.op1_kind == ix.OpKind.MEMORY:
             native = lower.memory_load(ins, lower.reg_name(ins.op0_register), mnemonic=formatter.format_mnemonic(ins))
         else:
             native = formatter.format(ins)
-        assembly += [wrapper(f"native_{index}", native), wrapper(f"lowered_{index}", lower.lower(ins, preserve_flags=preserve_flags, dead_registers=dead_registers))]
+        assembly += [wrapper(f"native_{index}", native), wrapper(f"lowered_{index}", lower.lower(
+            ins, preserve_flags=preserve_flags, dead_registers=dead_registers, dead_xmms=dead_xmms))]
         manifest.append({"instruction": formatter.format(ins), "mode": mode,
                          "preserve_flags": preserve_flags,
                          "dead_slots": [k for k, r in enumerate(registers)
-                                        if r in dead_registers and r != ix.RegisterExt.full_register(ins.op0_register)]})
+                                        if r in dead_registers and r != ix.RegisterExt.full_register(ins.op0_register)]
+                                       + [17 + (r - ix.Register.XMM0) * 2 + half
+                                          for r in sorted(dead_xmms) if r != ins.op0_register for half in (0, 1)]})
     assembly.append(lower.support_assembly())
     assembly.append('.section .testdata,"aw"\n.balign 16\n.global test_memory\ntest_memory:\n.zero 64\n.section .note.GNU-stack,"",@progbits\n')
     source = directory / "lower_test.s"

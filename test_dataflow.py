@@ -9,6 +9,14 @@ def hints(hex_bytes):
     return analyze(ix.Decoder(64, bytes.fromhex(hex_bytes)))
 
 
+def graph_hints(hex_bytes, *, missing=(), **kwargs):
+    code = bytes.fromhex(hex_bytes)
+    instructions = list(ix.Decoder(64, code, ip=0x1000))
+    lookup = {ins.ip: ins for ins in instructions if ins.ip not in missing}
+    return analyze(instructions, lookup=lookup.get,
+                   bounds=(0x1000, 0x1000 + len(code)), **kwargs)
+
+
 class DataflowTests(unittest.TestCase):
     def test_zero_idiom_and_full_writes(self):
         h = hints('31c0 4889cb')  # xor eax,eax; mov rbx,rcx
@@ -67,6 +75,68 @@ class DataflowTests(unittest.TestCase):
     def test_unanalysed_instructions_do_not_kill(self):
         self.assertTrue(hints('0fa2 31c0').preserve_flags)  # CPUID
         self.assertNotIn(ix.Register.RAX, hints('f7f3 31c0').dead_registers)  # DIV
+
+    def test_full_xmm_write_and_alias_reads(self):
+        h = hints('660fefc0 660f6fd1')  # pxor xmm0,xmm0; movdqa xmm2,xmm1
+        self.assertEqual(h.dead_xmms, {ix.Register.XMM0, ix.Register.XMM2})
+        h = hints('660f6fc1 660fefc9')  # reading xmm1 first prevents its kill
+        self.assertNotIn(ix.Register.XMM1, h.dead_xmms)
+
+    def test_partial_xmm_write_and_arithmetic_reads(self):
+        for code in ('f20f10c1 660fefc0', 'f30f10c1 660fefc0',
+                     '660fc4c001 660fefc0', '660ffcc1 660fefc0'):
+            self.assertNotIn(ix.Register.XMM0, hints(code).dead_xmms)
+
+    def test_scalar_movq_kills_whole_xmm(self):
+        self.assertIn(ix.Register.XMM0, hints('f30f7ec1').dead_xmms)
+
+    def test_float_exceptions_and_vex_remain_barriers(self):
+        for code in ('0f58c1 660fefc0', 'c5f957c0 31c0'):
+            h = hints(code)
+            self.assertFalse(h.dead_xmms)
+            self.assertFalse(h.dead_registers)
+
+    def test_both_conditional_successors_must_kill(self):
+        # je right; xor eax,eax; jmp end; right: xor eax,eax; end: ret
+        h = graph_hints('7404 31c0 eb02 31c0 c3')
+        self.assertIn(ix.Register.RAX, h.dead_registers)
+        self.assertTrue(h.preserve_flags)  # branch consumes old ZF
+        h = graph_hints('7404 31c0 eb02 89c1 c3')
+        self.assertNotIn(ix.Register.RAX, h.dead_registers)
+
+    def test_all_paths_xmm_kills(self):
+        h = graph_hints('7406 660fefc0 eb04 660fefc0 c3')
+        self.assertIn(ix.Register.XMM0, h.dead_xmms)
+        h = graph_hints('7406 660fefc0 eb04 660f6fc8 c3')
+        self.assertNotIn(ix.Register.XMM0, h.dead_xmms)
+
+    def test_branch_flags_read_after_a_kill_are_dead(self):
+        self.assertFalse(graph_hints('31c9 7404 31c0 eb02 31c0 c3').preserve_flags)
+
+    def test_loops_unknown_targets_and_limits_are_barriers(self):
+        self.assertNotIn(ix.Register.RAX,
+                         graph_hints('7402 ebfc 31c0 c3').dead_registers)
+        self.assertNotIn(ix.Register.RAX,
+                         graph_hints('7404 31c0 eb02 31c0 c3', missing={0x1006}).dead_registers)
+        self.assertNotIn(ix.Register.RAX,
+                         graph_hints('7404 31c0 eb02 31c0 c3', max_branches=0).dead_registers)
+        self.assertNotIn(ix.Register.RAX,
+                         graph_hints('7404 31c0 eb02 31c0 c3', max_nodes=2).dead_registers)
+
+    def test_branch_into_middle_of_instruction_is_unknown(self):
+        self.assertNotIn(ix.Register.RAX,
+                         graph_hints('eb01 b800000000 31c0 c3').dead_registers)
+
+    def test_out_of_function_and_indirect_edges_are_unknown(self):
+        self.assertNotIn(ix.Register.RAX, graph_hints('eb7e 31c0').dead_registers)
+        self.assertNotIn(ix.Register.RAX, graph_hints('ffe1 31c0').dead_registers)
+
+    def test_fault_on_one_successor_prevents_proof(self):
+        self.assertNotIn(ix.Register.RAX,
+                         graph_hints('7404 31c0 eb05 488b00 31c0 c3').dead_registers)
+
+    def test_loop_after_kill_keeps_valid_proof(self):
+        self.assertIn(ix.Register.RAX, graph_hints('31c0 ebfe').dead_registers)
 
 
 if __name__ == '__main__':
