@@ -72,7 +72,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True, type=Path)
     parser.add_argument("--core", type=Path,
-                        default=Path(__file__).resolve().parents[3] / "submodules/opemu-linux/core")
+                        default=Path(__file__).resolve().parents[1] / "opemu-linux/core")
     parser.add_argument("--iterations", type=int, default=300000)
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--json", type=Path)

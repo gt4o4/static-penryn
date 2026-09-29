@@ -186,7 +186,7 @@ def main():
         run(args.run, args.iterations)
         return
     if args.core is None:
-        args.core = Path(__file__).resolve().parents[3] / "submodules/opemu-linux/core"
+        args.core = Path(__file__).resolve().parents[1] / "opemu-linux/core"
     directory = Path(tempfile.mkdtemp(prefix="static-penryn-strings."))
     library = generate(directory, args.core)
     print(f"Artifacts: {directory}", flush=True)

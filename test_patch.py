@@ -217,7 +217,7 @@ class PatchTests(unittest.TestCase):
         address = 0x401010
         work = self.work / 'helpers'
         work.mkdir()
-        core = HERE.parents[2] / 'submodules/opemu-linux/core'
+        core = HERE.parent / 'opemu-linux/core'
         blob, symbols = patch.build_stubs([site], address, work, core)
         self.assertEqual(symbols['site_0'], address)
         elf = ELFFile(io.BytesIO((work / 'stubs.elf').read_bytes()))

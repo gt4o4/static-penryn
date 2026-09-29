@@ -519,7 +519,7 @@ def main():
     p.add_argument('--require-runtime', action='store_true', help='require every patched Go site to have verified runtime metadata')
     p.add_argument('--require-unwind', action='store_true', help='require complete native unwind coverage and verified runtime metadata for patched Go code')
     p.add_argument('--allow-relocate', action='store_true', help='experimental: borrow next instruction at short sites; known entry points protected, indirect entries not proven')
-    p.add_argument('--core', type=Path, default=HERE.parents[2] / 'submodules/opemu-linux/core')
+    p.add_argument('--core', type=Path, default=HERE.parent / 'opemu-linux/core')
     p.add_argument('--work-dir', type=Path, help='retain generated assembly and linked helpers')
     args = p.parse_args()
     args.unwind |= args.require_unwind or args.infer_unwind

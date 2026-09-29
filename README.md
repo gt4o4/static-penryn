@@ -1,5 +1,9 @@
 # Static Penryn patcher — experimental
 
+Moved with its history out of nix-configs' `hosts/iMacGBC/static-penryn/`
+on 2026-09-29. nix-configs keeps this checkout, gitignored, at
+`submodules/static-penryn/`; the commands below run from this checkout's root.
+
 This is an offline ELF64 rewriter for iMacGBC's Core 2 Duo. It replaces
 legacy POPCNT, CRC32, PCMPGTQ and PCMPxSTRx instructions with direct jumps
 to equivalent scalar/SSE2 code appended to the same executable. The result
@@ -9,7 +13,7 @@ core at `gt4o4/opemu-linux` revision
 `6641be603e64c14127542865d777907544ab739f`; its two source hashes are checked.
 Only arithmetic is reused, not the emulator's runtime machinery.
 
-**An experiment, not enabled in `penryn-overlays.nix`.** Both current
+**An experiment, not enabled in nix-configs' `penryn-overlays.nix`.** Both current
 applications pass the no-emulator tests below. Bounded control-flow recovery,
 profiling, shared regions and optional native unwind metadata are implemented.
 A restricted Go metadata backend, in-place Go counter and native frame
@@ -230,13 +234,13 @@ claude: b03ee84fce76643c414d868815ad3b74bfa856dda17bc0eb0da39d982213c1f7
 
 ## Run it
 
-From the repository root, build only the tool (no system toplevel build):
+Build only the tool, with iMacGBC's package set from nix-configs (no system
+toplevel build):
 
 ```sh
 nix build --impure --expr '
   let f = builtins.getFlake "git+file:///home/wenri/.config/nix-configs";
-  in f.nixosConfigurations.iMacGBC.pkgs.callPackage
-    ./hosts/iMacGBC/static-penryn { }
+  in f.nixosConfigurations.iMacGBC.pkgs.callPackage ./. { }
 ' --out-link /tmp/static-penryn-tool --max-jobs 0
 ```
 
@@ -248,12 +252,13 @@ not build the kernel/emulator. Alternatively:
 
 ```sh
 python3 -m venv /tmp/static-penryn-venv
-/tmp/static-penryn-venv/bin/pip install -r hosts/iMacGBC/static-penryn/requirements.txt
-/tmp/static-penryn-venv/bin/python hosts/iMacGBC/static-penryn/patch.py --help
+/tmp/static-penryn-venv/bin/pip install -r requirements.txt
+/tmp/static-penryn-venv/bin/python patch.py --help
 ```
 
 The Python route needs `cc` and `ld` on PATH and the pinned opemu checkout
-under `submodules/opemu-linux`; `--core /path/to/core` overrides that location.
+beside this one, at `../opemu-linux` (nix-configs' `submodules/opemu-linux`);
+`--core /path/to/core` overrides that location.
 For Go-aware recovery and strict runtime auditing, build `go_metadata.go`
 and set `PENRYN_GOMETA` as described in [RUNTIME.md](RUNTIME.md).
 
@@ -294,7 +299,8 @@ env -u LD_PRELOAD SIMDUTF_FORCE_IMPLEMENTATION=westmere \
   qemu-x86_64 -cpu Penryn /tmp/claude-static --version
 ```
 
-The installed agy already has `antigravity-cpuid-gate.py`'s two gate fixes.
+The installed agy already has the two gate fixes from nix-configs'
+`hosts/iMacGBC/antigravity-cpuid-gate.py`.
 A fresh upstream agy needs those applied to a writable copy first. This
 patcher does not spoof CPUID or remove startup gates. Disabling auto-update
 keeps agy from replacing the rewritten image with an upstream binary.
@@ -382,16 +388,16 @@ the patcher verifies it before publishing output.
 
 ```sh
 python=/tmp/static-penryn-venv/bin/python
-"$python" hosts/iMacGBC/static-penryn/test_dataflow.py
-"$python" hosts/iMacGBC/static-penryn/test_controlflow.py
-"$python" -m unittest discover -s hosts/iMacGBC/static-penryn -p test_regions.py
-"$python" hosts/iMacGBC/static-penryn/test_patch.py
-"$python" hosts/iMacGBC/static-penryn/test_integration.py
-"$python" hosts/iMacGBC/static-penryn/test_profile.py
-"$python" hosts/iMacGBC/static-penryn/test_runtime.py
-"$python" hosts/iMacGBC/static-penryn/test_lower.py --remote lix-ory
-"$python" hosts/iMacGBC/static-penryn/test_regions.py --remote lix-ory
-"$python" hosts/iMacGBC/static-penryn/test_strings.py --remote lix-ory
+"$python" test_dataflow.py
+"$python" test_controlflow.py
+"$python" -m unittest discover -s . -p test_regions.py
+"$python" test_patch.py
+"$python" test_integration.py
+"$python" test_profile.py
+"$python" test_runtime.py
+"$python" test_lower.py --remote lix-ory
+"$python" test_regions.py --remote lix-ory
+"$python" test_strings.py --remote lix-ory
 ```
 
 In preservation mode, the differential harnesses compare all GPRs, XMM
@@ -406,9 +412,9 @@ To compare generated code on Penryn without executing unsupported hardware
 instructions:
 
 ```sh
-"$python" hosts/iMacGBC/static-penryn/bench_lower.py \
+"$python" bench_lower.py \
   --baseline /path/to/previous/lower.py --output /tmp/leaf.json
-"$python" hosts/iMacGBC/static-penryn/bench_strings.py \
+"$python" bench_strings.py \
   --baseline /path/to/previous/string-sources --json /tmp/strings.json
 ```
 
