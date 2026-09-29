@@ -16,8 +16,8 @@ import iced_x86 as ix
 from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import SymbolTableSection
 
-import controlflow
-from native_frames import Gap, Recovery
+from static_penryn import controlflow
+from static_penryn.native_frames import Gap, Recovery
 
 
 # Claude 2.1.278 input SHA256 b03ee84fce76643c414d868815ad3b74bfa856dda17bc0eb0da39d982213c1f7.
@@ -337,7 +337,7 @@ class NativeUnwindIntegrationTests(unittest.TestCase):
     def test_strict_cli_infers_missing_fde_and_unwinds_native_timer(self):
         # Reuse the existing real libgcc signal oracle. Only exercise's CFI is
         # removed; its caller and the C harness retain compiler-authored CFI.
-        import test_runtime as fixtures
+        from . import test_runtime as fixtures
         _, hard = resource.getrlimit(resource.RLIMIT_CORE)
         resource.setrlimit(resource.RLIMIT_CORE, (0, hard))
         assembly = fixtures.ASM_FIXTURE.replace('BODY', 'popcnt rbx,rax\ncrc32 rdx,rax')
@@ -352,7 +352,7 @@ class NativeUnwindIntegrationTests(unittest.TestCase):
             subprocess.run(['cc', '-O2', '-fomit-frame-pointer', '-fasynchronous-unwind-tables',
                             '-no-pie', str(work / 'fixture.c'), str(work / 'fixture.S'),
                             '-o', str(original)], check=True, capture_output=True)
-            command = [sys.executable, str(fixtures.HERE / 'patch.py'), str(original),
+            command = [sys.executable, '-m', 'static_penryn.patch', str(original),
                        str(output), '--allow-relocate', '--require-unwind', '--no-dataflow']
             rejected = subprocess.run(command, capture_output=True, text=True, timeout=90)
             self.assertNotEqual(rejected.returncode, 0)
@@ -376,7 +376,7 @@ class NativeUnwindIntegrationTests(unittest.TestCase):
 
 class NativeFDEIndexTests(unittest.TestCase):
     def index(self):
-        import unwind
+        from static_penryn import unwind
 
         class Frame(dict):
             def __init__(self, start, end, marker):
@@ -404,7 +404,7 @@ class NativeFDEIndexTests(unittest.TestCase):
         fallback.row.assert_not_called()
 
     def test_ambiguous_overlap_rejects_without_inference(self):
-        import unwind
+        from static_penryn import unwind
         index, fallback = self.index()
         with self.assertRaisesRegex(unwind.Unsupported, 'multiple original FDEs'):
             index.row(130)

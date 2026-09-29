@@ -22,13 +22,15 @@ from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import SymbolTableSection
 from elftools.elf.relocation import RelocationSection
 from iced_x86 import BlockEncoder, Decoder, FlowControl, Mnemonic, OpKind, Register
-from dataflow import Hints, analyze
-from elfcheck import validate_elf
+from .dataflow import Hints, analyze
+from .elfcheck import validate_elf
 
 FAMILIES = {getattr(Mnemonic, name): name for name in (
     'POPCNT', 'CRC32', 'PCMPGTQ', 'PCMPISTRI', 'PCMPISTRM',
     'PCMPESTRI', 'PCMPESTRM', 'PCMPESTRI64', 'PCMPESTRM64')}
 HERE = Path(__file__).resolve().parent
+# The pinned opemu-linux checkout beside this one (nix-configs' submodules/).
+OPEMU_CORE = HERE.parents[1] / 'opemu-linux/core'
 CORE_HASHES = {
     'emu-core.c': '37afd5483069ddd7d746da5b247b425b7fad7b0b7f23c1335fd68097478de475',
     'emu-core.h': '805c42a74ada75b48c00e1d134b4b938647c25ecd718fd18df4205c8d30cc9cd',
@@ -292,9 +294,9 @@ def _relocate_tail(ins, address):
 
 
 def build_stubs(sites, address, work, core, *, region_loads=False, go_bodies=None):
-    import lower
-    import strings
-    import regions
+    from . import lower
+    from . import strings
+    from . import regions
     sequences = [regions.sequence(site) for site in sites]
     bodies, prefixes, suffixes, shared = [], [], [], []
     instructions = [i for site in sites for i in site.insns]
@@ -519,7 +521,7 @@ def main():
     p.add_argument('--require-runtime', action='store_true', help='require every patched Go site to have verified runtime metadata')
     p.add_argument('--require-unwind', action='store_true', help='require complete native unwind coverage and verified runtime metadata for patched Go code')
     p.add_argument('--allow-relocate', action='store_true', help='experimental: borrow next instruction at short sites; known entry points protected, indirect entries not proven')
-    p.add_argument('--core', type=Path, default=HERE.parent / 'opemu-linux/core')
+    p.add_argument('--core', type=Path, default=OPEMU_CORE)
     p.add_argument('--work-dir', type=Path, help='retain generated assembly and linked helpers')
     args = p.parse_args()
     args.unwind |= args.require_unwind or args.infer_unwind
@@ -544,16 +546,16 @@ def main():
     if elf.get_section_by_name('.penryn'):
         p.error('input already patched')
     validated = time.perf_counter()
-    import regions
-    import unwind
-    from controlflow import Recovery
+    from . import regions
+    from . import unwind
+    from .controlflow import Recovery
     weights = regions.read_profile(args.profile, digest(data)) if args.profile else None
     go_metadata = unwind.load_go_metadata(args.input)
     go_audit = None
     if args.go_inplace or args.go_runtime or args.go_dispatch:
         if go_metadata is None:
             p.error('Go transformations require the packaged Go metadata helper')
-        import go_runtime
+        from . import go_runtime
         go_audit = go_runtime.Audit(data, elf, go_metadata)
     functions = [(f['start'], f['end'], f['name']) for table in (go_metadata or {}).get('tables', [])
                  for f in table['functions']]
@@ -561,7 +563,7 @@ def main():
     recovery.add_functions(functions, source='go')
     frame_recovery = None
     if args.infer_unwind:
-        import native_frames
+        from . import native_frames
         frame_recovery = native_frames.Recovery(elf, recovery)
     print('Decoding executable sections...', flush=True)
     hits, targets, caves = scan(elf, metadata=metadata, recovery=recovery, frame_recovery=frame_recovery)
@@ -575,13 +577,13 @@ def main():
         p.error('no supported instructions found')
     inplace, unchanged_functions = [], []
     if args.go_inplace:
-        import go_inplace
+        from . import go_inplace
         inplace = go_inplace.plan(data, elf, go_metadata)
         unchanged_functions += [(a, b, sha) for name, (a, b, sha) in go_inplace.PINNED.items()
                                 if name != 'countbody']
     dormant = []
     if args.go_dispatch:
-        import go_inplace
+        from . import go_inplace
         dormant = go_inplace.dormant(data, elf, go_metadata)
         unchanged_functions += list(go_inplace.DISPATCH_PINNED.values())
     dormant_sites = {item['address'] for item in dormant}
@@ -609,7 +611,7 @@ def main():
         sites.sort(key=lambda site: (-max((weights.get(i.ip, 0) for i in site.insns), default=0), site.ip))
     go_bodies, go_proofs, go_rejected = {}, {}, []
     if args.go_runtime:
-        import go_lower
+        from . import go_lower
         go_bodies, go_proofs, go_rejected = go_lower.prepare(sites, go_audit,
                                                           allow_abi_borrow=not args.no_dataflow)
         # Go's findfunc interval is contiguous and contains Go stubs only.

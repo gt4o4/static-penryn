@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark old/new lowered PCMPxSTRx paths, with no unsupported opcode.
 
-  python bench_strings.py --baseline /path/to/old/strings-sources --json result.json
+  python -m tests.bench_strings --baseline /path/to/old/strings-sources --json result.json
 
 The baseline directory must contain an earlier strings.py and strings.c.
 This benchmark executes only scalar/SSE2 generated code, so it can run on
@@ -21,8 +21,9 @@ import time
 
 from iced_x86 import Decoder
 
-import strings
-from test_strings import machine
+from static_penryn import strings
+from static_penryn.patch import OPEMU_CORE
+from .test_strings import machine
 
 
 CASES = (("explicit_ranges", 2, 4), ("explicit_negative_ranges", 2, 20),
@@ -32,7 +33,9 @@ CASES = (("explicit_ranges", 2, 4), ("explicit_negative_ranges", 2, 20),
 
 
 def build(directory, baseline, core):
-    spec = importlib.util.spec_from_file_location("baseline_strings", baseline / "strings.py")
+    # As a module of the package, the baseline's relative .lower import resolves.
+    spec = importlib.util.spec_from_file_location("static_penryn.baseline_strings",
+                                                  baseline / "strings.py")
     old = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(old)
     asm = [".intel_syntax noprefix", ".text"]
@@ -72,7 +75,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True, type=Path)
     parser.add_argument("--core", type=Path,
-                        default=Path(__file__).resolve().parents[1] / "opemu-linux/core")
+                        default=OPEMU_CORE)
     parser.add_argument("--iterations", type=int, default=300000)
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--json", type=Path)

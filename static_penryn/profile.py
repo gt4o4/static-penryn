@@ -2,9 +2,9 @@
 """Count generated instructions under QEMU or attribute native perf samples.
 
 Examples (Python dependencies are the same as patch.py):
-  python profile.py count ./agy ./agy.json --work /tmp/agy-profile -- --help
-  python profile.py count ./claude ./claude.json --argv0 rg --work /tmp/rg-profile -- -c Penryn corpus.txt
-  python profile.py native ./agy ./agy.json --work /tmp/agy-perf -- --help
+  python -m static_penryn.profile count ./agy ./agy.json --work /tmp/agy-profile -- --help
+  python -m static_penryn.profile count ./claude ./claude.json --argv0 rg --work /tmp/rg-profile -- -c Penryn corpus.txt
+  python -m static_penryn.profile native ./agy ./agy.json --work /tmp/agy-perf -- --help
 
 QEMU counters are execution attempts, not native cycles. Native sampling uses
 perf's recorded MMAP records to normalize PIE addresses; static DSO symbol

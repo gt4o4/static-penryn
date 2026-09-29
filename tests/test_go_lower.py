@@ -11,10 +11,10 @@ import unittest
 
 import iced_x86 as ix
 from elftools.elf.elffile import ELFFile
-from dataflow import Hints
-import go_lower
-import lower
-from test_lower import state_wrapper, worker
+from static_penryn.dataflow import Hints
+from static_penryn import go_lower
+from static_penryn import lower
+from .test_lower import state_wrapper, worker
 
 
 def instruction(destination=ix.Register.RAX, source=ix.Register.RBX, width=8):

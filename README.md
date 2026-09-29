@@ -37,7 +37,7 @@ refuses unresolved cases.
   **124,800** hardware state comparisons pass. The countbody harness validates
   **1,225,380** cases through both Go ABI0 wrappers, including guard pages.
 - Executable and PIE registration fixtures verify GC, stack growth, function
-  lookup and named CPU profiles. See [RUNTIME.md](RUNTIME.md) for the contracts,
+  lookup and named CPU profiles. See [RUNTIME.md](docs/RUNTIME.md) for the contracts,
   commands and remaining application blockers.
 - The pinned agy backend retains Go's type-initialization fast path for the
   empty added module. A checked four-byte guard adjustment avoids 3.16 million
@@ -50,12 +50,12 @@ Claude gains **243 inferred native unwind ranges**, including the hot fused
 regex region; **1,630 generated ranges remain uncovered**. agy also retains
 two native unwind gaps involving unavailable caller RBX values. Full strict
 deployment remains blocked. The following sections retain earlier-pass results
-for comparison; [RUNTIME.md](RUNTIME.md) records the new coverage.
+for comparison; [RUNTIME.md](docs/RUNTIME.md) records the new coverage.
 
 Validation covers **181 regression cases** and all seven deterministic QEMU
 Penryn workloads. In 21 paired native runs, agy's median version/help startup
 times improve **1.5% / 3.2%** over the previous static patches; Claude remains
-essentially unchanged. [PROFILING.md](PROFILING.md) records the measurements,
+essentially unchanged. [PROFILING.md](docs/PROFILING.md) records the measurements,
 the diagnosed type-initialization cost and the final artifact hashes.
 
 ## Earlier profiling, regions and runtime pass, 2026-09-21
@@ -64,7 +64,7 @@ the diagnosed type-initialization cost and the final artifact hashes.
   expected results for version/help, UTF-8 regex, Unicode properties and file
   walking. `static-penryn profile` counts generated instructions with QEMU or
   samples native execution with perf. Exact output hashes and byte checks
-  prevent attribution to the wrong binary. See [PROFILING.md](PROFILING.md).
+  prevent attribution to the wrong binary. See [PROFILING.md](docs/PROFILING.md).
 - **Profile-guided layout and fusion:** `--profile FILE` orders hot stubs
   first. `--regions` joins bounded straight-line sequences and shares saves
   of scratch registers unused throughout the region. The original arithmetic
@@ -87,10 +87,10 @@ the diagnosed type-initialization cost and the final artifact hashes.
   fault unwinding and a bounded Go GC/profiling fixture exercise these paths.
   Without the new Go registration backend, that fixture completes but exposes appended PCs as
   `runtime._ExternalCode`; this remains a strict rejection, not a solved
-  safepoint/stack-growth problem. See [RUNTIME.md](RUNTIME.md).
+  safepoint/stack-growth problem. See [RUNTIME.md](docs/RUNTIME.md).
 
 This pass reuses iced-x86, GCC/binutils, pyelftools, QEMU, perf and Go's
-standard library. [REUSE.md](REUSE.md) explains their roles and why using
+standard library. [REUSE.md](docs/REUSE.md) explains their roles and why using
 LLVM BOLT as a complete replacement is not justified for these inputs.
 
 The new full inputs still contain 1,500 and 1,729 supported instructions.
@@ -104,7 +104,7 @@ All seven deterministic QEMU workloads pass on the new outputs. In Claude's
 hot four-POPCNT regex region, counting both original glue and appended stubs
 gives **104 → 86 guest instructions per iteration** (17.3% fewer), over
 43,213 iterations. Native whole-program timings and their limits are in
-[PROFILING.md](PROFILING.md).
+[PROFILING.md](docs/PROFILING.md).
 
 New validation includes **465,280** scalar/vector hardware comparisons and
 **31,000** shared-region hardware comparisons, with full live machine-state
@@ -232,6 +232,19 @@ agy:    baff3db5e4c09635709fa9838e4038c9b4f2c164ce7a80a18059393797d6802c
 claude: b03ee84fce76643c414d868815ad3b74bfa856dda17bc0eb0da39d982213c1f7
 ```
 
+## Layout
+
+- `static_penryn/`: the patcher package. `patch.py` is the command-line entry
+  point; the analysis, lowering and runtime modules sit beside the C string
+  helpers, the QEMU profiling plugin with its vendored `qemu-plugin.h`, and
+  `go_metadata.go` (the `penryn-go-metadata` helper).
+- `tests/`: regression tests, hardware oracles and developer benchmarks, with
+  their fixtures in `tests/fixtures/`. Run each from this checkout's root as
+  `python -m tests.<name>`.
+- `docs/`: [profiling](docs/PROFILING.md), [runtime contracts](docs/RUNTIME.md),
+  [Go runtime](docs/GO-RUNTIME.md) and [compiler/library reuse](docs/REUSE.md).
+- `default.nix`: the tool, built with iMacGBC's package set as below.
+
 ## Run it
 
 Build only the tool, with iMacGBC's package set from nix-configs (no system
@@ -253,14 +266,14 @@ not build the kernel/emulator. Alternatively:
 ```sh
 python3 -m venv /tmp/static-penryn-venv
 /tmp/static-penryn-venv/bin/pip install -r requirements.txt
-/tmp/static-penryn-venv/bin/python patch.py --help
+/tmp/static-penryn-venv/bin/python -m static_penryn.patch --help
 ```
 
 The Python route needs `cc` and `ld` on PATH and the pinned opemu checkout
 beside this one, at `../opemu-linux` (nix-configs' `submodules/opemu-linux`);
 `--core /path/to/core` overrides that location.
-For Go-aware recovery and strict runtime auditing, build `go_metadata.go`
-and set `PENRYN_GOMETA` as described in [RUNTIME.md](RUNTIME.md).
+For Go-aware recovery and strict runtime auditing, build
+`static_penryn/go_metadata.go` and set `PENRYN_GOMETA` as described in [RUNTIME.md](docs/RUNTIME.md).
 
 Pass the **payload ELF**, not its small launcher. For the measured versions:
 
@@ -377,7 +390,7 @@ the patcher verifies it before publishing output.
   are safe on a tiny Go stack merely because startup works.
 - Optional native CFI covers supported frame rules, with gaps reported;
   it does not relocate C++ landing pads. The separate Go backend supports
-  only the registered stack-neutral contract in [GO-RUNTIME.md](GO-RUNTIME.md).
+  only the registered stack-neutral contract in [GO-RUNTIME.md](docs/GO-RUNTIME.md).
   Go refuses unknown PCs as async safe points, but faults/profilers/signals
   can observe a temporary stack/register state. Exact original fault PC
   and signal-context semantics are not preserved. Sustained real workloads
@@ -388,16 +401,16 @@ the patcher verifies it before publishing output.
 
 ```sh
 python=/tmp/static-penryn-venv/bin/python
-"$python" test_dataflow.py
-"$python" test_controlflow.py
-"$python" -m unittest discover -s . -p test_regions.py
-"$python" test_patch.py
-"$python" test_integration.py
-"$python" test_profile.py
-"$python" test_runtime.py
-"$python" test_lower.py --remote lix-ory
-"$python" test_regions.py --remote lix-ory
-"$python" test_strings.py --remote lix-ory
+"$python" -m tests.test_dataflow
+"$python" -m tests.test_controlflow
+"$python" -m unittest tests.test_regions
+"$python" -m tests.test_patch
+"$python" -m tests.test_integration
+"$python" -m tests.test_profile
+"$python" -m tests.test_runtime
+"$python" -m tests.test_lower --remote lix-ory
+"$python" -m tests.test_regions --remote lix-ory
+"$python" -m tests.test_strings --remote lix-ory
 ```
 
 In preservation mode, the differential harnesses compare all GPRs, XMM
@@ -412,14 +425,16 @@ To compare generated code on Penryn without executing unsupported hardware
 instructions:
 
 ```sh
-"$python" bench_lower.py \
+"$python" -m tests.bench_lower \
   --baseline /path/to/previous/lower.py --output /tmp/leaf.json
-"$python" bench_strings.py \
+"$python" -m tests.bench_strings \
   --baseline /path/to/previous/string-sources --json /tmp/strings.json
 ```
 
 Preserve the previous `strings.py` and `strings.c` together for the latter.
-Benchmark scripts never change opemu.
+It loads that `strings.py` as a module of `static_penryn`, so its `.lower`
+import resolves; a copy from before the package layout needs `from lower`
+changed to `from .lower`. Benchmark scripts never change opemu.
 
 References: [iced relocation API](https://github.com/icedland/iced/blob/master/src/rust/iced-x86-py/README.md),
 [Go async safe-point checks](https://go.dev/src/runtime/preempt.go).

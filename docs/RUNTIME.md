@@ -209,17 +209,18 @@ recorded in [PROFILING.md](PROFILING.md).
 
 ## Reproduce the runtime tests
 
-With the patcher's Python dependencies, GCC/binutils, Go and QEMU on PATH:
+From the checkout root, with the patcher's Python dependencies, GCC/binutils,
+Go and QEMU on PATH:
 
 ```sh
-go build -o /tmp/penryn-go-metadata ./go_metadata.go
+go build -o /tmp/penryn-go-metadata ./static_penryn/go_metadata.go
 PENRYN_GOMETA=/tmp/penryn-go-metadata \
-  python test_runtime.py
+  python -m tests.test_runtime
 PENRYN_GOMETA=/tmp/penryn-go-metadata \
-  python test_native_frames.py
-python test_go_runtime.py
-python test_go_inplace.py
-python test_go_lower.py --remote lix-ory
+  python -m tests.test_native_frames
+python -m tests.test_go_runtime
+python -m tests.test_go_inplace
+python -m tests.test_go_lower --remote lix-ory
 ```
 
 The native fixtures compile without frame pointers and sample the running
@@ -246,7 +247,7 @@ The bounded Go fixture is separately available for exploratory stress:
 
 ```sh
 GO111MODULE=off GOAMD64=v1 go build -o /tmp/go-runtime-original \
-  ./runtime-fixtures/go
+  ./tests/fixtures/go
 static-penryn /tmp/go-runtime-original /tmp/go-runtime-patched \
   --allow-relocate --no-dataflow
 GOGC=1 GOMEMLIMIT=16MiB PENRYN_STRESS_ROUNDS=1200 qemu-x86_64 -cpu Penryn \

@@ -16,12 +16,9 @@ import tempfile
 import unittest
 
 from iced_x86 import Decoder, FlowControl
-import patch
-from elfcheck import validate_elf
-import test_patch as fixtures
-
-
-HERE = Path(__file__).resolve().parent
+from static_penryn import patch
+from static_penryn.elfcheck import validate_elf
+from . import test_patch as fixtures
 
 
 class IntegrationTests(unittest.TestCase):
@@ -45,7 +42,7 @@ class IntegrationTests(unittest.TestCase):
     def invoke(self, binary, *arguments, name='output', success=True):
         before = binary.read_bytes()
         output = self.work / name
-        result = subprocess.run([sys.executable, str(HERE / 'patch.py'), str(binary),
+        result = subprocess.run([sys.executable, '-m', 'static_penryn.patch', str(binary),
                                  str(output), *map(str, arguments)],
                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(binary.read_bytes(), before, 'input changed during rewrite')

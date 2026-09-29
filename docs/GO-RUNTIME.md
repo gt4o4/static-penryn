@@ -141,8 +141,8 @@ created dynamically by an application.
 
 ## Validation
 
-Run `python test_go_runtime.py -v` with Go, GCC/binutils, iced-x86, pyelftools and
-QEMU available. The thirteen tests cover PC-table encoding and malformed inputs,
+Run `python -m tests.test_go_runtime -v` from the checkout root with Go,
+GCC/binutils, iced-x86, pyelftools and QEMU available. The thirteen tests cover PC-table encoding and malformed inputs,
 forbidden stack/call operations, and real Go runtime execution through:
 
 - ELF entry in a static executable;

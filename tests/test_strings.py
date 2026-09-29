@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare static PCMPxSTRx lowerings with SSE4.2 hardware.
 
-    python test_strings.py --remote lix-ory
+    python -m tests.test_strings --remote lix-ory
 
 Generation needs iced-x86 and a local C compiler; the remote machine needs
 only Python and native SSE4.2.  Do not use an opemu-enabled Penryn as the
@@ -54,7 +54,7 @@ def machine(form, imm, shape="ordinary"):
 def generate(directory, core):
     # Deferred so a hardware worker has no third-party Python dependency.
     from iced_x86 import Decoder
-    from strings import build_helpers, lower
+    from static_penryn.strings import build_helpers, lower
 
     lines = [".intel_syntax noprefix", ".text"]
     instructions = []
@@ -186,7 +186,8 @@ def main():
         run(args.run, args.iterations)
         return
     if args.core is None:
-        args.core = Path(__file__).resolve().parents[1] / "opemu-linux/core"
+        from static_penryn.patch import OPEMU_CORE
+        args.core = OPEMU_CORE
     directory = Path(tempfile.mkdtemp(prefix="static-penryn-strings."))
     library = generate(directory, args.core)
     print(f"Artifacts: {directory}", flush=True)

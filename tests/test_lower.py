@@ -2,7 +2,7 @@
 """Differential-test leaf lowerings against SSE4.2 hardware.
 
 Run with the patcher's Python dependencies installed:
-  python test_lower.py --remote lix-ory
+  python -m tests.test_lower --remote lix-ory
 The generated shared library has no external dependencies.  The remote
 worker needs only Python 3, and must have real SSE4.2/POPCNT hardware.
 """
@@ -102,7 +102,7 @@ def state_wrapper(name, body):
 
 def generate(directory):
     import iced_x86 as ix
-    import lower
+    from static_penryn import lower
 
     names = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi"] + [f"r{i}" for i in range(8, 16)]
     registers = [getattr(ix.Register, n.upper()) for n in names]

@@ -12,7 +12,7 @@ import unittest
 
 import iced_x86 as ix
 from elftools.elf.elffile import ELFFile
-from controlflow import Recovery
+from static_penryn.controlflow import Recovery
 
 
 BODY = '''
@@ -212,9 +212,9 @@ ret
         # Compare grouping with the former dense per-terminator leader set.
         # Coalescing affects padding only; original instruction boundaries and
         # explicit direct targets still prevent crossing a real interior entry.
-        import regions
-        from patch import Site
-        from dataflow import Hints
+        from static_penryn import regions
+        from static_penryn.patch import Site
+        from static_penryn.dataflow import Hints
         sites = [Site([i], i.ip - section['sh_addr'], i.next_ip, hints=[Hints()])
                  for i in instructions if i.mnemonic == ix.Mnemonic.POPCNT]
         targets = {conditional.near_branch_target, jump.near_branch_target}

@@ -21,8 +21,8 @@ Wrong bias cannot silently turn into an all-zero profile.
 
 ## Dependencies and commands
 
-Use the same Python environment as `patch.py`, plus `cc`, QEMU user-mode
-with plugins, and GLib development headers. `profile_plugin.c` includes the
+From the checkout root, use the same Python environment as `patch.py`, plus
+`cc`, QEMU user-mode with plugins, and GLib development headers. `profile_plugin.c` includes the
 **unmodified QEMU v10.2.4 `qemu-plugin.h`**, API version 5, from
 [upstream](https://gitlab.com/qemu-project/qemu/-/blob/v10.2.4/include/qemu/qemu-plugin.h).
 The vendored header SHA-256 is
@@ -34,14 +34,14 @@ the explicit `PENRYN_GLIB_CFLAGS` environment variable in Nix wrappers.
 The corresponding upstream license is retained as `qemu-plugin.LICENSE`.
 
 ```sh
-python profile.py count /tmp/agy /tmp/agy.json --work /tmp/agy-profile -- --help
-python profile.py count /tmp/claude /tmp/claude.json --argv0 rg \
+python -m static_penryn.profile count /tmp/agy /tmp/agy.json --work /tmp/agy-profile -- --help
+python -m static_penryn.profile count /tmp/claude /tmp/claude.json --argv0 rg \
   --work /tmp/rg-profile -- -c Penryn /tmp/corpus.txt
-python profile.py native /tmp/agy /tmp/agy.json --perf /path/to/perf \
+python -m static_penryn.profile native /tmp/agy /tmp/agy.json --perf /path/to/perf \
   --work /tmp/agy-native -- --help
-python workloads.py --agy /tmp/agy --claude /tmp/claude \
+python -m static_penryn.workloads --agy /tmp/agy --claude /tmp/claude \
   --work /tmp/penryn-workloads
-python test_profile.py
+python -m tests.test_profile
 ```
 
 The Nix package supplies these dependencies and exposes the same commands
@@ -77,7 +77,7 @@ lines; raw samples and executable hashes are retained in `benchmark.json`.
 The desktop remains active, so small differences require cautious reading.
 
 ```sh
-python bench_apps.py --agy-before /tmp/agy-old --agy-after /tmp/agy-new \
+python -m static_penryn.bench_apps --agy-before /tmp/agy-old --agy-after /tmp/agy-new \
   --claude-before /tmp/claude-old --claude-after /tmp/claude-new \
   --work /tmp/penryn-native-timings
 
@@ -236,7 +236,7 @@ reported by the patcher; successful workloads do not close those gaps.
 Reproduce the native comparison with the prepared artifacts:
 
 ```sh
-python bench_apps.py \
+python -m static_penryn.bench_apps \
   --agy-before /tmp/static-penryn-next/agy-profiled-final \
   --agy-after /tmp/static-penryn-runtime/agy-final-v4 \
   --claude-before /tmp/static-penryn-next/claude-regions-final \

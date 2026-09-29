@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from elftools.elf.elffile import ELFFile
 from iced_x86 import Decoder, Mnemonic, Register
 
-import go_runtime
+from static_penryn import go_runtime
 
 HERE = Path(__file__).resolve().parent
 GO = shutil.which('go') or '/nix/store/hfb2fkwkkr6jdcg2ggibvf1zablw7i57-go-1.26.7/share/go/bin/go'
@@ -128,8 +128,8 @@ class TypeGuard(unittest.TestCase):
             subprocess.run(['cc','-no-pie','-Wl,--section-start=.exact_guard=0x6884f9d',
                             '-Wl,--section-start=.original_next=0xbcc9810',
                             '-Wl,--section-start=.synthetic_next=0x10242230',
-                            '-o',str(output),str(HERE/'runtime-fixtures/typelinks-guard.c'),
-                            str(HERE/'runtime-fixtures/typelinks-guard.S')],check=True,capture_output=True)
+                            '-o',str(output),str(HERE/'fixtures/typelinks-guard.c'),
+                            str(HERE/'fixtures/typelinks-guard.S')],check=True,capture_output=True)
             data=output.read_bytes();elf=ELFFile(io.BytesIO(data))
             segments=[s for s in elf.iter_segments() if s['p_type']=='PT_LOAD']
             def offset(a,n):
@@ -161,8 +161,8 @@ class LegacyStartup(unittest.TestCase):
             output=Path(name)/'preinit'
             subprocess.run(['cc','-fPIE','-pie','-nostartfiles','-Wl,-e,legacy_entry',
                             '-Wl,-init,replacement_init','-Wa,--defsym,TEST_PREINIT=1',
-                            '-o',str(output),str(HERE/'runtime-fixtures/legacy-init.c'),
-                            str(HERE/'runtime-fixtures/legacy-init.S')],check=True,capture_output=True)
+                            '-o',str(output),str(HERE/'fixtures/legacy-init.c'),
+                            str(HERE/'fixtures/legacy-init.S')],check=True,capture_output=True)
             elf=ELFFile(io.BytesIO(output.read_bytes()))
             tags={tag.entry.d_tag:tag.entry.d_val for tag in elf.get_section_by_name('.dynamic').iter_tags()}
             self.assertEqual(tags['DT_PREINIT_ARRAYSZ'],8)
@@ -177,8 +177,8 @@ class LegacyStartup(unittest.TestCase):
             original=directory/'legacy'
             subprocess.run(['cc','-fPIE','-pie','-nostartfiles','-Wl,-e,legacy_entry',
                             '-Wl,-init,replacement_init','-o',str(original),
-                            str(HERE/'runtime-fixtures/legacy-init.c'),
-                            str(HERE/'runtime-fixtures/legacy-init.S')],check=True,capture_output=True)
+                            str(HERE/'fixtures/legacy-init.c'),
+                            str(HERE/'fixtures/legacy-init.S')],check=True,capture_output=True)
             data=original.read_bytes()
             def audit_for(raw):
                 elf=ELFFile(io.BytesIO(raw))
@@ -252,10 +252,10 @@ class Registration(unittest.TestCase):
         resource.setrlimit(resource.RLIMIT_CORE, (0, hard))
         cls.temp = tempfile.TemporaryDirectory(prefix='penryn-go-metadata-test-')
         cls.work = Path(cls.temp.name)
-        (cls.work/'main.go').write_bytes((HERE/'runtime-fixtures/go-metadata-main.go').read_bytes())
-        (cls.work/'force_amd64.s').write_bytes((HERE/'runtime-fixtures/go-metadata-force.s').read_bytes())
+        (cls.work/'main.go').write_bytes((HERE/'fixtures/go-metadata-main.go').read_bytes())
+        (cls.work/'force_amd64.s').write_bytes((HERE/'fixtures/go-metadata-force.s').read_bytes())
         cls.helper = cls.work/'penryn-go-metadata'
-        subprocess.run([GO, 'build', '-o', str(cls.helper), str(HERE/'go_metadata.go')],
+        subprocess.run([GO, 'build', '-o', str(cls.helper), str(HERE.parent/'static_penryn/go_metadata.go')],
                        check=True, capture_output=True, env={**os.environ, 'GOMAXPROCS':'2'})
 
     @classmethod
@@ -263,9 +263,9 @@ class Registration(unittest.TestCase):
         cls.temp.cleanup()
 
     def prepare(self, pie, external=False):
-        import go_lower
-        import patch
-        import unwind
+        from static_penryn import go_lower
+        from static_penryn import patch
+        from static_penryn import unwind
         original = self.work/('original-external' if external else ('original-pie' if pie else 'original'))
         subprocess.run([GO, 'build', '-buildmode='+('pie' if pie else 'exe'), '-o', str(original), *(['-ldflags=-linkmode external'] if external else []), '.'],
                        cwd=self.work, check=True, capture_output=True,

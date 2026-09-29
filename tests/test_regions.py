@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Grouping counterexamples and shared-frame hardware equivalence.
 
-Unit tests: python -m unittest test_regions
-Full GPR/XMM/flags/red-zone oracle: python test_regions.py --remote lix-ory
+Unit tests: python -m unittest tests.test_regions
+Full GPR/XMM/flags/red-zone oracle: python -m tests.test_regions --remote lix-ory
 The remote worker reuses test_lower.py and refuses a CPU lacking real ISA
 support. It never uses kernel opemu as its expected-result implementation.
 """
@@ -18,11 +18,11 @@ import unittest
 
 import iced_x86 as ix
 from elftools.elf.elffile import ELFFile
-from dataflow import Hints, analyze
-from patch import Site
-import lower
-import regions
-from test_lower import state_wrapper, worker
+from static_penryn.dataflow import Hints, analyze
+from static_penryn.patch import Site
+from static_penryn import lower
+from static_penryn import regions
+from .test_lower import state_wrapper, worker
 
 
 def decode(code):

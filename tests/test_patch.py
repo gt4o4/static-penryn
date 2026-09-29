@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Structural and end-to-end regression checks for the experimental patcher.
 
-Run with the patcher's Python dependencies, cc/ld and qemu-x86_64 on PATH:
-    python test_patch.py
+Run from the checkout root with the patcher's Python dependencies, cc/ld and
+qemu-x86_64 on PATH:
+    python -m tests.test_patch
 These fixtures execute under a Penryn CPU model without an emulator preload.
 """
 import hashlib
@@ -22,11 +23,8 @@ import unittest
 from elftools.elf.elffile import ELFFile
 from iced_x86 import Decoder
 
-import patch
-from elfcheck import validate_elf
-
-
-HERE = Path(__file__).resolve().parent
+from static_penryn import patch
+from static_penryn.elfcheck import validate_elf
 
 
 class PatchTests(unittest.TestCase):
@@ -87,7 +85,7 @@ class PatchTests(unittest.TestCase):
         before = binary.read_bytes()
         output = self.work / "output"
         result = subprocess.run(
-            [sys.executable, str(HERE / "patch.py"), str(binary), str(output), *flags],
+            [sys.executable, "-m", "static_penryn.patch", str(binary), str(output), *flags],
             capture_output=True, text=True,
         )
         self.assertEqual(binary.read_bytes(), before, "source ELF changed")
@@ -217,7 +215,7 @@ class PatchTests(unittest.TestCase):
         address = 0x401010
         work = self.work / 'helpers'
         work.mkdir()
-        core = HERE.parent / 'opemu-linux/core'
+        core = patch.OPEMU_CORE
         blob, symbols = patch.build_stubs([site], address, work, core)
         self.assertEqual(symbols['site_0'], address)
         elf = ELFFile(io.BytesIO((work / 'stubs.elf').read_bytes()))
@@ -284,7 +282,7 @@ class PatchTests(unittest.TestCase):
         output = self.work / 'output'
         output.write_bytes(b'keep existing output')
         result = subprocess.run(
-            [sys.executable, str(HERE / 'patch.py'), str(binary), str(output)],
+            [sys.executable, '-m', 'static_penryn.patch', str(binary), str(output)],
             capture_output=True, text=True,
         )
         self.assertNotEqual(result.returncode, 0)

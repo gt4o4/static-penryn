@@ -2,7 +2,7 @@
 """Liveness counterexamples: preservation must win whenever proof is absent."""
 import unittest
 import iced_x86 as ix
-from dataflow import analyze
+from static_penryn.dataflow import analyze
 
 
 def hints(hex_bytes):

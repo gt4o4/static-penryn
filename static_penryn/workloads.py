@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Deterministic, credential-free startup/search/file-walk profile workloads.
 
-  python workloads.py --agy ./agy --claude ./claude --work /tmp/penryn-workloads
-  python workloads.py --claude ./claude --mode native --perf /path/to/perf --work /tmp/penryn-native
+  python -m static_penryn.workloads --agy ./agy --claude ./claude --work /tmp/penryn-workloads
+  python -m static_penryn.workloads --claude ./claude --mode native --perf /path/to/perf --work /tmp/penryn-native
 
 Reports default to BINARY.json. Every application receives a fresh HOME and
 an allowlisted environment. Search expected output is computed while writing
@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 import resource
 
-import profile as profiler
+from . import profile as profiler
 
 
 def fixture(directory, *, files=64, lines=512):

@@ -35,35 +35,19 @@ let
     iced
     p.pyelftools
   ]);
+  # The package directory holds exactly what the tool runs; local bytecode
+  # caches stay out of the store path.
   source = lib.fileset.toSource {
     root = ./.;
-    fileset = lib.fileset.unions [
-      ./patch.py
-      ./dataflow.py
-      ./elfcheck.py
-      ./controlflow.py
-      ./regions.py
-      ./unwind.py
-      ./native_frames.py
-      ./go_lower.py
-      ./go_runtime.py
-      ./go_inplace.py
-      ./lower.py
-      ./strings.py
-      ./strings.c
-      ./profile.py
-      ./profile_plugin.c
-      ./qemu-plugin.h
-      ./qemu-plugin.LICENSE
-      ./workloads.py
-      ./bench_apps.py
-    ];
+    fileset = lib.fileset.difference ./static_penryn (
+      lib.fileset.maybeMissing ./static_penryn/__pycache__
+    );
   };
   goMetadata = runCommand "penryn-go-metadata" { nativeBuildInputs = [ go ]; } ''
     mkdir -p "$out/bin"
     export GOCACHE="$TMPDIR/go-cache"
     CGO_ENABLED=0 GOAMD64=v1 go build -trimpath -ldflags="-s -w" \
-      -o "$out/bin/penryn-go-metadata" ${./go_metadata.go}
+      -o "$out/bin/penryn-go-metadata" ${./static_penryn/go_metadata.go}
   '';
 in
 writeShellApplication {
@@ -78,16 +62,17 @@ writeShellApplication {
   text = ''
     export PENRYN_GOMETA=${goMetadata}/bin/penryn-go-metadata
     export PENRYN_GLIB_CFLAGS="-I${glib.dev}/include/glib-2.0 -I${glib.out}/lib/glib-2.0/include"
+    export PYTHONPATH=${source}
     if [[ "''${1-}" == profile ]]; then
       shift
-      exec python3 ${source}/profile.py "$@"
+      exec python3 -m static_penryn.profile "$@"
     elif [[ "''${1-}" == workloads ]]; then
       shift
-      exec python3 ${source}/workloads.py "$@"
+      exec python3 -m static_penryn.workloads "$@"
     elif [[ "''${1-}" == bench ]]; then
       shift
-      exec python3 ${source}/bench_apps.py "$@"
+      exec python3 -m static_penryn.bench_apps "$@"
     fi
-    exec python3 ${source}/patch.py --core ${custom.sse42-emu.src}/core "$@"
+    exec python3 -m static_penryn.patch --core ${custom.sse42-emu.src}/core "$@"
   '';
 }

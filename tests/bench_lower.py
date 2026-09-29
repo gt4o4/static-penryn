@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measure generated leaf sequences on the target CPU, without an emulator.
 
-  python bench_lower.py --baseline /path/to/old/lower.py --output /tmp/bench.json
+  python -m tests.bench_lower --baseline /path/to/old/lower.py --output /tmp/bench.json
 
 Each timed call runs a million lowerings in a native assembly loop. Reports
 include loop overhead and save/restore cost; they are microbenchmarks rather
@@ -22,7 +22,7 @@ import time
 
 def generate(directory, baseline):
     import iced_x86 as ix
-    import lower
+    from static_penryn import lower
 
     variants = [("preserved", lower.lower, {}),
                 ("flags_dead", lower.lower, {"preserve_flags": False}),

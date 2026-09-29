@@ -192,7 +192,7 @@ def plan(data, elf, metadata, *, work=None):
             raise ValueError(f'changed pinned Go function bytes: {name}')
     # Parse the original runtime structures, not a caller-supplied boolean.
     # FuncFlagAsm disables asynchronous Go preemption in this pinned runtime.
-    import go_runtime
+    from . import go_runtime
     runtime_evidence = go_runtime.Audit(data, elf, metadata).inplace('countbody')
     body, symbols = assemble(work)
     covered = START

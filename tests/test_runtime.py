@@ -21,7 +21,7 @@ import unittest
 from elftools.elf.elffile import ELFFile
 from iced_x86 import Decoder,Mnemonic
 
-import unwind
+from static_penryn import unwind
 
 HERE = Path(__file__).resolve().parent
 
@@ -166,7 +166,7 @@ class RuntimeTests(unittest.TestCase):
 
     def patch(self, binary, *extra):
         output = self.work/'patched'
-        run = subprocess.run([sys.executable,str(HERE/'patch.py'),str(binary),str(output),
+        run = subprocess.run([sys.executable,'-m','static_penryn.patch',str(binary),str(output),
                               '--allow-relocate','--require-unwind',*extra],
                              capture_output=True,text=True,timeout=90)
         self.assertEqual(run.returncode,0,run.stdout+run.stderr)
@@ -294,10 +294,10 @@ class GoMetadataTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix='penryn-go-metadata-')
         cls.work = Path(cls.tmp.name)
         cls.helper = cls.work/'penryn-go-metadata'
-        subprocess.run(['go','build','-o',str(cls.helper),str(HERE/'go_metadata.go')],check=True)
+        subprocess.run(['go','build','-o',str(cls.helper),str(HERE.parent/'static_penryn/go_metadata.go')],check=True)
         cls.binary = cls.work/'go-original'
         env = {**os.environ,'GO111MODULE':'off','GOAMD64':'v1'}
-        subprocess.run(['go','build','-o',str(cls.binary),'.'],cwd=HERE/'runtime-fixtures/go',env=env,check=True)
+        subprocess.run(['go','build','-o',str(cls.binary),'.'],cwd=HERE/'fixtures/go',env=env,check=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -331,7 +331,7 @@ class GoMetadataTests(unittest.TestCase):
     def test_require_unwind_refuses_go_before_publishing(self):
         output = self.work/'go-strict'
         env = {**os.environ,'PENRYN_GOMETA':str(self.helper)}
-        result = subprocess.run([sys.executable,str(HERE/'patch.py'),str(self.binary),str(output),
+        result = subprocess.run([sys.executable,'-m','static_penryn.patch',str(self.binary),str(output),
                                  '--allow-relocate','--require-unwind'],
                                 capture_output=True,text=True,timeout=90,env=env)
         self.assertNotEqual(result.returncode,0)

@@ -12,7 +12,7 @@ import json
 import re
 
 import iced_x86 as ix
-import lower
+from . import lower
 
 
 GLUE = {getattr(ix.Mnemonic, name) for name in (

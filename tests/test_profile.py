@@ -12,8 +12,8 @@ import unittest
 
 from elftools.elf.elffile import ELFFile
 
-import profile as profiler
-import workloads
+from static_penryn import profile as profiler
+from static_penryn import workloads
 
 
 class ProfileTests(unittest.TestCase):
@@ -123,7 +123,7 @@ again:
         profiles, addresses = [], None
         for grouped in (False, True):
             output = self.work / ('grouped' if grouped else 'separate')
-            rewritten = subprocess.run([sys.executable, str(profiler.HERE / 'patch.py'), str(binary), str(output),
+            rewritten = subprocess.run([sys.executable, '-m', 'static_penryn.patch', str(binary), str(output),
                                         *(['--regions', '--allow-relocate'] if grouped else [])], capture_output=True)
             self.assertEqual(rewritten.returncode, 0, (rewritten.stdout + rewritten.stderr).decode(errors='replace'))
             report = json.loads(Path(str(output) + '.json').read_text())

@@ -13,7 +13,7 @@ import subprocess
 
 from iced_x86 import Code, Decoder, FlowControl, InstructionInfoFactory, Mnemonic, OpKind, Register
 
-from lower import memory_load
+from .lower import memory_load
 
 
 SUPPORTED = frozenset(

@@ -9,8 +9,8 @@ import re
 
 import iced_x86 as ix
 
-from dataflow import Hints
-import lower
+from .dataflow import Hints
+from . import lower
 
 
 class Unsupported(ValueError):

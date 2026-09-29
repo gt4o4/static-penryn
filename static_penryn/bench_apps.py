@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Paired warm native application timings, with output and identity checks.
 
-  python bench_apps.py --agy-before /tmp/agy-old --agy-after /tmp/agy-new \
+  python -m static_penryn.bench_apps --agy-before /tmp/agy-old --agy-after /tmp/agy-new \
     --claude-before /tmp/claude-old --claude-after /tmp/claude-new \
     --work /tmp/penryn-app-benchmark
 
@@ -17,8 +17,8 @@ import statistics
 import subprocess
 import time
 
-import profile as profiler
-import workloads
+from . import profile as profiler
+from . import workloads
 
 
 def cpu_snapshot():

@@ -11,7 +11,7 @@ import unittest
 
 from elftools.elf.elffile import ELFFile
 
-import go_inplace
+from static_penryn import go_inplace
 
 
 BRIDGES = r'''
