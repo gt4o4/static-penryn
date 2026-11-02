@@ -234,8 +234,9 @@ version and help on QEMU Penryn with no emulator, and its five workloads.
 The region oracle (32,200 comparisons) and the lowering oracle (465,280)
 passed on lix-ory. A follow-up (`67f51ce`) puts the new constant in a
 section of its own, so outputs without a mask count keep their bytes (agy's
-`3f549ea2…`). nix-configs pins 0.2.0 in `a7362526`, and iMacGBC takes it at
-its next switch.
+`3f549ea2…`). nix-configs pins 0.2.0 in `a7362526`; iMacGBC has run it
+since generation 490 (2026-11-02, 17:15), where `claude --version` and
+`agy --version` emulate 0 instructions.
 
 ## Development
 
