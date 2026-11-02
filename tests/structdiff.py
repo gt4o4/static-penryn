@@ -99,7 +99,7 @@ def byte_ranges(b: ELFFile, ma: mmap.mmap, mb: mmap.mmap) -> None:
         if ma[off:off + chunk] == mb[off:off + chunk]:
             continue
         for o2 in range(off, min(off + chunk, n), 4096):
-            ca, cb = ma[o2:o2 + 4096], mb[o2:o2 + 4096]
+            ca, cb = ma[o2:min(o2 + 4096, n)], mb[o2:min(o2 + 4096, n)]
             if ca == cb:
                 continue
             for i in range(len(ca)):
