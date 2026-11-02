@@ -1,0 +1,9 @@
+from collections.abc import Iterator
+
+from elftools.dwarf.callframe import CIE, FDE, ZERO
+from elftools.dwarf.compileunit import CompileUnit
+
+class DWARFInfo:
+    def has_EH_CFI(self) -> bool: ...
+    def EH_CFI_entries(self) -> list[CIE | FDE | ZERO]: ...
+    def iter_CUs(self) -> Iterator[CompileUnit]: ...

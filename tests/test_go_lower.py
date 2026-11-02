@@ -7,17 +7,20 @@ from pathlib import Path
 import shlex
 import subprocess
 import tempfile
+from typing import TypedDict
 import unittest
 
 import iced_x86 as ix
 from elftools.elf.elffile import ELFFile
+from elftools.elf.sections import SymbolTableSection
 from static_penryn.dataflow import Hints
 from static_penryn import go_lower
 from static_penryn import lower
 from .test_lower import state_wrapper, worker
 
 
-def instruction(destination=ix.Register.RAX, source=ix.Register.RBX, width=8):
+def instruction(destination: ix.Register_ = ix.Register.RAX, source: ix.Register_ = ix.Register.RBX,
+                width: int = 8) -> ix.Instruction:
     if width == 4:
         destination = ix.RegisterExt.full_register32(destination)
         source = ix.RegisterExt.full_register32(source)
@@ -27,23 +30,24 @@ def instruction(destination=ix.Register.RAX, source=ix.Register.RBX, width=8):
 
 
 class Contract(unittest.TestCase):
-    def test_requires_dead_xmm(self):
+    def test_requires_dead_xmm(self) -> None:
         for available in (frozenset(), frozenset({ix.Register.XMM15})):
             with self.assertRaises(go_lower.Unsupported):
                 go_lower.lower_popcnt(instruction(), dead_xmms=available)
 
-    def test_reserved_destination(self):
+    def test_reserved_destination(self) -> None:
         for register in (ix.Register.RSP, ix.Register.RBP, ix.Register.R14):
             with self.assertRaises(go_lower.Unsupported):
                 go_lower.lower_popcnt(instruction(register), dead_xmms=frozenset({ix.Register.XMM0}))
 
-    def test_proven_dead_gpr_needs_no_xmm(self):
+    def test_proven_dead_gpr_needs_no_xmm(self) -> None:
         body, proof = go_lower.lower_popcnt(instruction(), Hints(dead_registers=frozenset({ix.Register.RCX})))
-        self.assertEqual(proof['dead_xmms'], [])
+        no_xmms: list[str] = []
+        self.assertEqual(proof['dead_xmms'], no_xmms)
         self.assertNotIn('rsp', body)
         self.assertNotIn('movq', body)
 
-    def test_final_byte_audit(self):
+    def test_final_byte_audit(self) -> None:
         for code in (b'', b'\x50', b'\x5d', b'\x49\x89\xc6', b'\xff\xd0',
                      b'\x48\x8b\x00', b'\x48\x89\x00', b'\x48\x8b\x05\x00\x00\x00\x00'):
             with self.subTest(code=code.hex()), self.assertRaises(go_lower.Unsupported):
@@ -52,9 +56,18 @@ class Contract(unittest.TestCase):
                                   constant_ranges=[(0x1007, 0x100f)])
 
 
-def generate(work):
+class Case(TypedDict):
+    """One manifest row for test_lower's worker."""
+    instruction: str
+    mode: str
+    preserve_flags: bool
+    proof: go_lower.LoweringProof
+    dead_slots: list[int]
+
+
+def generate(work: Path) -> Path:
     assembly = ['.intel_syntax noprefix', '.text']
-    manifest = []
+    manifest: list[Case] = []
     formatter = ix.Formatter(ix.FormatterSyntax.INTEL)
     for destination in lower._REGS:
         if destination in (ix.Register.RBP, ix.Register.R14):
@@ -83,9 +96,12 @@ def generate(work):
     library = work/'lower_test.so'
     subprocess.run(['cc', '-shared', '-fPIC', '-o', str(library), str(work/'go_lower.S')], check=True)
     elf = ELFFile(io.BytesIO(library.read_bytes()))
-    symbols = {s.name: s['st_value'] for s in elf.get_section_by_name('.symtab').iter_symbols()}
+    symtab = elf.get_section_by_name('.symtab')
+    assert isinstance(symtab, SymbolTableSection)
+    symbols = {s.name: s['st_value'] for s in symtab.iter_symbols()}
     code = elf.get_section_by_name('.text')
     rodata = elf.get_section_by_name('.rodata')
+    assert code is not None and rodata is not None
     for n in range(len(manifest)):
         a, b = symbols[f'body_{n}'], symbols[f'end_{n}']
         go_lower.validate_emitted(code.data()[a-code['sh_addr']:b-code['sh_addr']], a,
@@ -94,11 +110,16 @@ def generate(work):
     return library
 
 
-def main():
+class Arguments(argparse.Namespace):
+    remote: str | None
+    iterations: int
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--remote')
     parser.add_argument('--iterations', type=int, default=40)
-    args = parser.parse_args()
+    args = parser.parse_args(namespace=Arguments())
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(Contract)
     if not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful():
         raise SystemExit(1)

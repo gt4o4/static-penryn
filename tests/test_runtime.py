@@ -5,8 +5,6 @@ The signal tests intentionally use libgcc's real unwinder from a warmed-up
 signal handler. They measure the implementation, not a general assertion
 that arbitrary application callbacks are async-signal-safe.
 """
-import io
-import json
 import os
 from pathlib import Path
 import resource
@@ -15,13 +13,18 @@ import signal
 import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
+from typing import TYPE_CHECKING, ClassVar
 import unittest
 
+from elftools.dwarf.callframe import CFARule, RegisterRule
 from elftools.elf.elffile import ELFFile
 from iced_x86 import Decoder,Mnemonic
 
-from static_penryn import unwind
+from static_penryn import checked, unwind
+from static_penryn.patch import Site
+
+if TYPE_CHECKING:
+    from elftools.dwarf.callframe import CFIRow
 
 HERE = Path(__file__).resolve().parent
 
@@ -146,16 +149,16 @@ ret
 
 class RuntimeTests(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         _, hard = resource.getrlimit(resource.RLIMIT_CORE)
         resource.setrlimit(resource.RLIMIT_CORE, (0, hard))
 
-    def setUp(self):
+    def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix='penryn-runtime-')
         self.addCleanup(self.tmp.cleanup)
         self.work = Path(self.tmp.name)
 
-    def compile(self, body):
+    def compile(self, body: str) -> Path:
         (self.work/'fixture.c').write_text(C_FIXTURE)
         (self.work/'fixture.S').write_text(ASM_FIXTURE.replace('BODY',body))
         binary = self.work/'original'
@@ -164,20 +167,21 @@ class RuntimeTests(unittest.TestCase):
                         '-o',str(binary)],check=True)
         return binary
 
-    def patch(self, binary, *extra):
+    def patch(self, binary: Path, *extra: str) -> tuple[Path, list[str], dict[str, object]]:
         output = self.work/'patched'
         run = subprocess.run([sys.executable,'-m','static_penryn.patch',str(binary),str(output),
                               '--allow-relocate','--require-unwind',*extra],
                              capture_output=True,text=True,timeout=90)
         self.assertEqual(run.returncode,0,run.stdout+run.stderr)
-        report = json.loads(Path(str(output)+'.json').read_text())
+        report = checked.as_object(checked.load_json(Path(str(output)+'.json').read_text()),'patch report')
         with output.open('rb') as stream:
             sec = ELFFile(stream).get_section_by_name('.penryn')
             self.assertIsNotNone(sec)
+            assert sec is not None
             limits = [hex(sec['sh_addr']),hex(sec['sh_addr']+sec['sh_size'])]
         return output,limits,report
 
-    def test_timer_backtraces_from_scalar_replacements(self):
+    def test_timer_backtraces_from_scalar_replacements(self) -> None:
         binary = self.compile('popcnt rbx,rax\ncrc32 rdx,rax\npcmpgtq xmm1,xmm2')
         output,limits,_ = self.patch(binary,'--no-dataflow')
         result = subprocess.run([str(output),*limits,'timer'],capture_output=True,text=True,timeout=25)
@@ -185,7 +189,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('failures=0',result.stdout)
         print('native timer:',result.stdout.strip())
 
-    def test_frame_pointer_walks_during_string_helper(self):
+    def test_frame_pointer_walks_during_string_helper(self) -> None:
         assembly = ASM_FIXTURE.replace('BODY','pcmpestri xmm1,xmm2,0x0c')
         assembly = assembly.replace('sub rsp,8\n.cfi_adjust_cfa_offset 8\ncall exercise',
             'push rbp\n.cfi_def_cfa_offset 16\n.cfi_offset rbp,-16\n'
@@ -209,7 +213,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('failures=0',result.stdout)
         print('native frame pointers:',result.stdout.strip())
 
-    def test_fault_backtrace_and_fault_address_under_penryn(self):
+    def test_fault_backtrace_and_fault_address_under_penryn(self) -> None:
         binary = self.compile('popcnt rax,QWORD PTR [rdi]')
         output,limits,_ = self.patch(binary)
         env = os.environ.copy();env.pop('LD_PRELOAD',None)
@@ -221,7 +225,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn(b'FAULT_UNWIND_OK',result.stdout)
 
-    def test_timer_backtraces_from_string_helper(self):
+    def test_timer_backtraces_from_string_helper(self) -> None:
         binary = self.compile('mov edx,16\nmov eax,16\npcmpestri xmm1,xmm2,0')
         output,limits,_ = self.patch(binary,'--no-dataflow')
         result = subprocess.run([str(output),*limits,'timer'],capture_output=True,text=True,timeout=25)
@@ -229,23 +233,22 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('failures=0',result.stdout)
         print('native string timer:',result.stdout.strip())
 
-    def test_timer_backtraces_from_shared_frame_region(self):
+    def test_timer_backtraces_from_shared_frame_region(self) -> None:
         binary = self.compile('popcnt rbx,rax\nadd rbx,rdx\npopcnt rdx,rax\n'
                               'popcnt rsi,rax\npopcnt rdi,rax')
         output,limits,report = self.patch(binary,'--no-dataflow','--regions')
-        self.assertGreater(report['fused_regions'],0)
-        self.assertTrue(report['unwind']['native_coverage_complete'])
+        self.assertGreater(checked.as_int(report['fused_regions'],'fused regions'),0)
+        self.assertTrue(checked.as_object(report['unwind'],'unwind report')['native_coverage_complete'])
         result = subprocess.run([str(output),*limits,'timer'],capture_output=True,text=True,timeout=25)
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertIn('failures=0',result.stdout)
         print('native shared-frame timer:',result.stdout.strip())
 
-    def test_dynamic_stack_anchor_cfi(self):
+    def test_dynamic_stack_anchor_cfi(self) -> None:
         # These rows reconstruct the original frame-pointer CFA after the
         # trampoline saves RBP, repurposes it, then aligns RSP dynamically.
-        from elftools.dwarf.callframe import CFARule,RegisterRule
-        inherited = {'cfa':CFARule(reg=6,offset=16),16:RegisterRule('OFFSET',-8),
-                     6:RegisterRule('OFFSET',-16)}
+        inherited: CFIRow = {'cfa':CFARule(reg=6,offset=16),16:RegisterRule('OFFSET',-8),
+                             6:RegisterRule('OFFSET',-16)}
         code=bytes.fromhex('488d64248055488bec4883e4f0')
         machine=unwind.Machine()
         for ins in Decoder(64,code):
@@ -253,17 +256,17 @@ class RuntimeTests(unittest.TestCase):
             machine.rules(inherited)
         self.assertIsNone(machine.delta)
         self.assertIn(6,machine.anchors)
-        stack_cfa = {**inherited,'cfa':CFARule(reg=7,offset=16)}
+        stack_cfa: CFIRow = {**inherited,'cfa':CFARule(reg=7,offset=16)}
         self.assertTrue(machine.rules(stack_cfa)[0].startswith('.cfi_escape 15,'))
 
-    def test_missing_original_fde_is_explicit_gap(self):
+    def test_missing_original_fde_is_explicit_gap(self) -> None:
         binary=self.compile('popcnt rbx,rax')
         with binary.open('rb') as stream:
             index=unwind.Index(ELFFile(stream))
             with self.assertRaisesRegex(unwind.Unsupported,'no native'):
                 index.row(1)
 
-    def test_original_signal_frame_is_refused(self):
+    def test_original_signal_frame_is_refused(self) -> None:
         binary=self.compile('popcnt rbx,rax')
         with binary.open('rb') as stream:
             index=unwind.Index(ELFFile(stream))
@@ -272,7 +275,7 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(unwind.Unsupported,'signal frame'):
                 index.row(fde['initial_location'])
 
-    def test_helper_lsda_is_refused(self):
+    def test_helper_lsda_is_refused(self) -> None:
         binary=self.compile('popcnt rbx,rax')
         with binary.open('rb') as stream:
             fde=unwind.Index(ELFFile(stream)).fdes[-1]
@@ -280,15 +283,20 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(unwind.Unsupported,'landing pads'):
                 unwind._helper_assembly(fde)
 
-    def test_untracked_stack_write_refused(self):
+    def test_untracked_stack_write_refused(self) -> None:
         machine=unwind.Machine()
         with self.assertRaisesRegex(unwind.Unsupported,'untracked'):
             machine.step(Decoder(64,bytes.fromhex('4889c4')).decode())
 
 
 class GoMetadataTests(unittest.TestCase):
+    tmp: ClassVar[tempfile.TemporaryDirectory[str]]
+    work: ClassVar[Path]
+    helper: ClassVar[Path]
+    binary: ClassVar[Path]
+
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         if not shutil.which('go'):
             raise unittest.SkipTest('Go compiler required for runtime metadata fixtures')
         cls.tmp = tempfile.TemporaryDirectory(prefix='penryn-go-metadata-')
@@ -296,39 +304,48 @@ class GoMetadataTests(unittest.TestCase):
         cls.helper = cls.work/'penryn-go-metadata'
         subprocess.run(['go','build','-o',str(cls.helper),str(HERE.parent/'static_penryn/go_metadata.go')],check=True)
         cls.binary = cls.work/'go-original'
+        source = cls.work/'fixture'
+        source.mkdir()
+        (source/'main.go').write_bytes((HERE/'fixtures/go-metadata-main.go').read_bytes())
+        (source/'force_amd64.s').write_bytes((HERE/'fixtures/go-metadata-force.s').read_bytes())
         env = {**os.environ,'GO111MODULE':'off','GOAMD64':'v1'}
-        subprocess.run(['go','build','-o',str(cls.binary),'.'],cwd=HERE/'fixtures/go',env=env,check=True)
+        subprocess.run(['go','build','-o',str(cls.binary),'.'],cwd=source,env=env,check=True)
 
     @classmethod
-    def tearDownClass(cls):
+    def tearDownClass(cls) -> None:
         cls.tmp.cleanup()
 
-    def test_standard_library_recovers_stripped_go(self):
+    def test_standard_library_recovers_stripped_go(self) -> None:
         stripped = self.work/'go-stripped'
         subprocess.run(['objcopy','--strip-all',str(self.binary),str(stripped)],check=True)
         metadata = unwind.load_go_metadata(stripped,self.helper)
+        assert metadata is not None
         self.assertTrue(metadata['tables'])
-        self.assertEqual(metadata['rejected_candidates'],[])
+        unresolved: list[str] = []
+        self.assertEqual(metadata['rejected_candidates'],unresolved)
         functions = [f for t in metadata['tables'] for f in t['functions']]
         self.assertTrue(any('main.forcedPopcnt' in f['name'] for f in functions))
 
-    def test_go_sites_fail_runtime_gate(self):
+    def test_go_sites_fail_runtime_gate(self) -> None:
         metadata = unwind.load_go_metadata(self.binary,self.helper)
+        assert metadata is not None
         with self.binary.open('rb') as stream:
             elf=ELFFile(stream)
             functions = [f for t in metadata['tables'] for f in t['functions']]
             force = next(f for f in functions if 'main.forcedPopcnt' in f['name'])
             text = elf.get_section_by_name('.text')
+            assert text is not None
             offset = force['start']-text['sh_addr']
             instructions=list(Decoder(64,text.data()[offset:offset+force['end']-force['start']],ip=force['start']))
             ins=next(i for i in instructions if i.mnemonic==Mnemonic.POPCNT)
-            audit=unwind.audit_runtime(elf,[SimpleNamespace(insns=[ins])],metadata)
+            site=Site(insns=[ins],offset=text['sh_offset']+ins.ip-text['sh_addr'],end=ins.next_ip)
+            audit=unwind.audit_runtime([site],metadata)
         self.assertEqual(len(audit['go_patch_sites']),1)
         self.assertFalse(audit['production_ready'])
         self.assertFalse(audit['go_safepoints_supported'])
         self.assertTrue(audit['strict_runtime_reasons'])
 
-    def test_require_unwind_refuses_go_before_publishing(self):
+    def test_require_unwind_refuses_go_before_publishing(self) -> None:
         output = self.work/'go-strict'
         env = {**os.environ,'PENRYN_GOMETA':str(self.helper)}
         result = subprocess.run([sys.executable,'-m','static_penryn.patch',str(self.binary),str(output),

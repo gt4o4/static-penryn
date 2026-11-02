@@ -6,6 +6,9 @@ Run with the patcher's Python dependencies installed:
 The generated shared library has no external dependencies.  The remote
 worker needs only Python 3, and must have real SSE4.2/POPCNT hardware.
 """
+# Unevaluated annotations keep this file, which is the remote worker, free
+# of typing names its python3 may lack.
+from __future__ import annotations
 
 import argparse
 import ctypes
@@ -16,25 +19,45 @@ import resource
 import shlex
 import subprocess
 import tempfile
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import TypeIs
 
 
-def worker(library, iterations):
+# static_penryn.checked's JSON checks; the remote worker cannot import it.
+def is_object(value: object) -> TypeIs[dict[str, object]]:
+    if not isinstance(value, dict):
+        return False
+    return all(isinstance(key, str) for key in value)
+
+
+def is_list(value: object) -> TypeIs[list[object]]:
+    return isinstance(value, list)
+
+
+def worker(library: pathlib.Path, iterations: int) -> None:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     cpu_flags = set(pathlib.Path("/proc/cpuinfo").read_text().split("flags", 1)[1].split("\n", 1)[0].split())
     if not {"sse4_2", "popcnt"} <= cpu_flags:
         raise RuntimeError("hardware oracle requires real SSE4.2/POPCNT; opemu is not an oracle")
-    manifest = json.loads(library.with_suffix(".json").read_text())
+    manifest: object = json.loads(library.with_suffix(".json").read_text())
+    if not is_list(manifest):
+        raise ValueError(f"{library.with_suffix('.json')} is not a JSON array")
     lib = ctypes.CDLL(str(library.resolve()))
     State = ctypes.c_uint64 * 65
+    Pointer = ctypes.POINTER(State)
     memory = (ctypes.c_uint64 * 8).in_dll(lib, "test_memory")
     randomizer = random.Random(0x50454E52594E)
     flags_mask = 0xCD5  # Six arithmetic flags plus DF.
     checked = 0
     edges = [0, 1, (1 << 64) - 1, 1 << 63, (1 << 63) - 1, 0xAAAAAAAAAAAAAAAA]
     for index, case in enumerate(manifest):
-        native = getattr(lib, f"native_{index}")
-        lowered = getattr(lib, f"lowered_{index}")
-        native.argtypes = lowered.argtypes = [ctypes.POINTER(State), ctypes.POINTER(State)]
+        if not is_object(case):
+            raise ValueError(f"manifest entry {index} is not a JSON object")
+        native = lib[f"native_{index}"]
+        lowered = lib[f"lowered_{index}"]
+        native.argtypes = lowered.argtypes = [Pointer, Pointer]
         native.restype = lowered.restype = None
         for trial in range(iterations):
             values = [randomizer.getrandbits(64) for _ in range(65)]
@@ -53,14 +76,19 @@ def worker(library, iterations):
                 values[1] = 2
             for k in range(8):
                 memory[k] = randomizer.getrandbits(64) if trial >= len(edges) else edges[trial]
-            initial, expected, actual = State(*values), State(), State()
-            native(ctypes.byref(initial), ctypes.byref(expected))
-            lowered(ctypes.byref(initial), ctypes.byref(actual))
+            initial, native_state, lowered_state = State(*values), State(), State()
+            native(ctypes.byref(initial), ctypes.byref(native_state))
+            lowered(ctypes.byref(initial), ctypes.byref(lowered_state))
+            # ctypes types array items as Any; read the slots through the buffer.
+            expected, actual = (memoryview(state).cast("B").cast("Q").tolist()
+                                for state in (native_state, lowered_state))
             # Both wrappers use the same C ABI stack depth; RSP must also match.
             if not case.get("preserve_flags", True):
                 expected[16] &= ~0x8d5
                 actual[16] &= ~0x8d5
             ignored = case.get("dead_slots", [])
+            if not is_list(ignored):
+                raise ValueError(f"{case}: dead_slots is not a JSON array")
             differences = [(k, hex(expected[k]), hex(actual[k])) for k in range(65)
                            if k not in ignored and expected[k] != actual[k]]
             if differences:
@@ -71,7 +99,7 @@ def worker(library, iterations):
 
 
 
-def state_wrapper(name, body):
+def state_wrapper(name: str, body: str) -> str:
     names = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi"] + [f"r{i}" for i in range(8, 16)]
     lines = [f".global {name}", f".type {name}, @function", f"{name}:"]
     for register in ("rbx", "rbp", "r12", "r13", "r14", "r15"):
@@ -100,28 +128,37 @@ def state_wrapper(name, body):
     return "\n".join(lines + ["ret", f".size {name}, .-{name}"]) + "\n"
 
 
-def generate(directory):
+def generate(directory: pathlib.Path) -> pathlib.Path:
     import iced_x86 as ix
     from static_penryn import lower
+    from static_penryn.checked import constants
 
+    def as_register(value: int) -> ix.Register_:
+        # iced's Register type is a plain int at runtime (ix.Register_ is int).
+        if not isinstance(value, ix.Register_):
+            raise TypeError(f"not a register: {value!r}")
+        return value
+
+    register_names = constants(ix.Register)
     names = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi"] + [f"r{i}" for i in range(8, 16)]
-    registers = [getattr(ix.Register, n.upper()) for n in names]
+    registers = [as_register(register_names[n.upper()]) for n in names]
+    xmms = [as_register(r) for r in range(ix.Register.XMM0, ix.Register.XMM15 + 1)]
     formatter = ix.Formatter(ix.FormatterSyntax.INTEL)
     formatter.hex_prefix, formatter.hex_suffix = "0x", ""
     formatter.uppercase_hex = False
-    cases = []
+    cases: list[tuple[ix.Instruction, str]] = []
     codes = [(ix.Code.POPCNT_R16_RM16, 2, 2), (ix.Code.POPCNT_R32_RM32, 4, 4),
              (ix.Code.POPCNT_R64_RM64, 8, 8), (ix.Code.CRC32_R32_RM8, 4, 1),
              (ix.Code.CRC32_R32_RM16, 4, 2), (ix.Code.CRC32_R32_RM32, 4, 4),
              (ix.Code.CRC32_R64_RM8, 8, 1), (ix.Code.CRC32_R64_RM64, 8, 8)]
 
-    def sized(register, size):
+    def sized(register: ix.Register_, size: int) -> ix.Register_:
         name = lower._reg(register, size).upper()
         if name.startswith("R") and name.endswith("B"):
             name = name[:-1] + "L"
-        return getattr(ix.Register, name)
+        return as_register(register_names[name])
 
-    def add(ins, mode="register"):
+    def add(ins: ix.Instruction, mode: str = "register") -> None:
         # Normalize synthetic instructions exactly as the patcher's decoder does.
         encoder = ix.Encoder(64)
         encoder.encode(ins, 0x2000000)
@@ -148,8 +185,8 @@ def generate(directory):
                 ("rip", ix.MemoryOperand(ix.Register.RIP, displ=0x4000000, displ_size=4)),
             ]:
                 add(ix.Instruction.create_reg_mem(code, sized(destination, dst_size), operand), mode)
-    for destination in range(ix.Register.XMM0, ix.Register.XMM15 + 1):
-        for source in range(ix.Register.XMM0, ix.Register.XMM15 + 1):
+    for destination in xmms:
+        for source in xmms:
             add(ix.Instruction.create_reg_reg(ix.Code.PCMPGTQ_XMM_XMMM128, destination, source))
         for mode, operand in [
             ("base", ix.MemoryOperand(ix.Register.RDI)),
@@ -162,12 +199,13 @@ def generate(directory):
     wrapper = state_wrapper
 
     assembly = [".intel_syntax noprefix\n.text\n"]
-    manifest = []
+    manifest: list[dict[str, object]] = []
     dead = frozenset(r for r in registers if r != ix.Register.RSP)
     variants = [(True, frozenset()), (False, frozenset()), (True, dead), (False, dead)]
     all_xmms = frozenset(range(ix.Register.XMM0, ix.Register.XMM15 + 1))
-    configurations = [(ins, mode, flags, dead, frozenset())
-                      for ins, mode in cases for flags, dead in variants]
+    configurations: list[tuple[ix.Instruction, str, bool, frozenset[int], frozenset[int]]] = [
+        (ins, mode, flags, dead, frozenset())
+        for ins, mode in cases for flags, dead in variants]
     configurations += [(ins, mode, flags, dead_regs, all_xmms)
                        for ins, mode in cases if ins.mnemonic == ix.Mnemonic.PCMPGTQ
                        for flags, dead_regs in ((True, frozenset()), (False, dead))]
@@ -186,21 +224,27 @@ def generate(directory):
                                           for r in sorted(dead_xmms) if r != ins.op0_register for half in (0, 1)]})
     assembly.append(lower.support_assembly())
     assembly.append('.section .testdata,"aw"\n.balign 16\n.global test_memory\ntest_memory:\n.zero 64\n.section .note.GNU-stack,"",@progbits\n')
-    source = directory / "lower_test.s"
-    source.write_text("".join(assembly))
+    source_file = directory / "lower_test.s"
+    source_file.write_text("".join(assembly))
     library = directory / "lower_test.so"
-    subprocess.run(["cc", "-shared", "-nostdlib", "-Wl,--section-start=.testdata=0x4000000", "-o", str(library), str(source)], check=True)
+    subprocess.run(["cc", "-shared", "-nostdlib", "-Wl,--section-start=.testdata=0x4000000", "-o", str(library), str(source_file)], check=True)
     library.with_suffix(".json").write_text(json.dumps(manifest))
     return library
 
 
-def main():
+class Arguments(argparse.Namespace):
+    remote: str | None
+    run: pathlib.Path | None
+    iterations: int
+
+
+def main() -> None:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote", help="SSH host with real SSE4.2/POPCNT hardware")
     parser.add_argument("--run", type=pathlib.Path, help=argparse.SUPPRESS)
     parser.add_argument("--iterations", type=int, default=40)
-    args = parser.parse_args()
+    args = parser.parse_args(namespace=Arguments())
     if args.run:
         worker(args.run, args.iterations)
         return

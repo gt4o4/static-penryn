@@ -5,19 +5,57 @@ metadata must mark the entire range unsafe for asynchronous preemption while
 a pointer may temporarily be hidden in that XMM register. This module never
 assumes that an arbitrary XMM is free: the caller supplies proof-backed hints.
 """
+from collections.abc import Iterable, Sequence
 import re
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import iced_x86 as ix
 
 from .dataflow import Hints
 from . import lower
 
+if TYPE_CHECKING:
+    from .go_runtime import Audit, AuditFunction
+    from .patch import Site
+
 
 class Unsupported(ValueError):
     pass
 
 
-def lower_popcnt(ins, hints=Hints(), *, dead_xmms=frozenset()):
+# Stack use, which the Go contract forbids.
+_STACK = re.compile(r'\b(?:push\w*|pop(?:fq)?|rsp|esp)\b')
+
+
+class LoweringProof(TypedDict):
+    """Why a Go POPCNT body leaves the stack, frame and goroutine register intact."""
+    kind: str
+    stack_delta: int
+    no_calls: bool
+    no_memory_writes: bool
+    preserved_frame_pointer: bool
+    preserved_goroutine_register: bool
+    dead_gprs: NotRequired[list[str]]
+    dead_xmms: list[str]
+    parked_gprs: list[str]
+    requires_unsafe_pcdata: bool
+
+
+class SiteProof(LoweringProof):
+    original_pc: int
+    function: str
+    scratch_proof: str
+    layout_profile: str
+
+
+class Rejection(TypedDict):
+    address: int
+    function: str
+    reason: str
+
+
+def lower_popcnt(ins: ix.Instruction, hints: Hints = Hints(), *,
+                 dead_xmms: frozenset[int] = frozenset()) -> tuple[str, LoweringProof]:
     if (ins.mnemonic != ix.Mnemonic.POPCNT
             or ins.op0_kind != ix.OpKind.REGISTER or ins.op1_kind != ix.OpKind.REGISTER
             or ix.RegisterExt.size(ins.op0_register) not in (4, 8)):
@@ -27,7 +65,7 @@ def lower_popcnt(ins, hints=Hints(), *, dead_xmms=frozenset()):
         raise Unsupported('Go lowering cannot change RSP, RBP or the goroutine register')
     dead_gprs = hints.dead_registers - {ix.Register.RBP, ix.Register.R14}
     direct = lower.lower(ins, preserve_flags=hints.preserve_flags, dead_registers=dead_gprs)
-    if not re.search(r'\b(?:push\w*|pop(?:fq)?|rsp|esp)\b', direct):
+    if not _STACK.search(direct):
         return direct, {
             'kind': 'go-stack-neutral-popcnt', 'stack_delta': 0,
             'no_calls': True, 'no_memory_writes': True,
@@ -48,7 +86,7 @@ def lower_popcnt(ins, hints=Hints(), *, dead_xmms=frozenset()):
     scratch_name = lower.reg_name(scratch)
     xmm = available[0]
     xmm_name = lower.reg_name(xmm)
-    if re.search(r'\b(?:push\w*|pop(?:fq)?|rsp|esp)\b', body):
+    if _STACK.search(body):
         raise Unsupported('scalar implementation introduced a forbidden Go stack/register operation')
     # Preserve even GPRs declared dead: the only non-output clobber is the
     # explicitly dead XMM, keeping original GPR pointer values at both exits.
@@ -62,7 +100,8 @@ def lower_popcnt(ins, hints=Hints(), *, dead_xmms=frozenset()):
     }
 
 
-def validate_emitted(code, address, *, constant_ranges=()):
+def validate_emitted(code: bytes, address: int, *,
+                     constant_ranges: Sequence[tuple[int, int]] = ()) -> list[ix.Instruction]:
     """Audit final linked bytes; constants may be read only through RIP."""
     info = ix.InstructionInfoFactory()
     instructions = list(ix.Decoder(64, code, ip=address))
@@ -93,7 +132,7 @@ def validate_emitted(code, address, *, constant_ranges=()):
     return instructions
 
 
-def unused_function_xmms(audit, function):
+def unused_function_xmms(audit: 'Audit', function: 'AuditFunction') -> frozenset[int]:
     """Borrow an unused register only under a verified Go ABIInternal profile."""
     if not audit.abi_internal(function):
         return frozenset()
@@ -112,10 +151,13 @@ def unused_function_xmms(audit, function):
     return frozenset(unused)
 
 
-def prepare(sites, audit, *, allow_abi_borrow=True):
+def prepare(sites: 'Iterable[Site]', audit: 'Audit', *, allow_abi_borrow: bool = True
+            ) -> tuple[dict[int, str], dict[int, SiteProof], list[Rejection]]:
     """Prepare independently supported Go sites, recording every rejection."""
-    bodies, proofs, rejected = {}, {}, []
-    borrowed = {}
+    bodies: dict[int, str] = {}
+    proofs: dict[int, SiteProof] = {}
+    rejected: list[Rejection] = []
+    borrowed: dict[int, frozenset[int]] = {}
     for site in sites:
         try:
             f = audit.function(site.ip)
@@ -130,11 +172,11 @@ def prepare(sites, audit, *, allow_abi_borrow=True):
                 borrowed[f['start']] = unused_function_xmms(audit, f) if allow_abi_borrow else frozenset()
             hint = site.hints[0] if site.hints else Hints()
             body, proof = lower_popcnt(site.insns[0], hint, dead_xmms=borrowed[f['start']])
-            state = audit.replacement_site(site.ip)
+            audit.replacement_site(site.ip)
             bodies[site.ip] = body
-            proofs[site.ip] = dict(proof, original_pc=site.ip, function=f['name'],
-                                  scratch_proof='local-dataflow' if proof.get('dead_gprs') or hint.dead_xmms else 'verified-ABIInternal-unused-XMM',
-                                  layout_profile=audit.profile['name'])
+            proofs[site.ip] = {**proof, 'original_pc': site.ip, 'function': f['name'],
+                               'scratch_proof': 'local-dataflow' if proof.get('dead_gprs') or hint.dead_xmms else 'verified-ABIInternal-unused-XMM',
+                               'layout_profile': audit.profile['name']}
         except ValueError as error:
             rejected.append(dict(address=site.ip, function=f['name'], reason=str(error)))
     return bodies, proofs, rejected

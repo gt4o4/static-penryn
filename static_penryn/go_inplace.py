@@ -6,16 +6,29 @@ stack frame, call, external mapping or relocation. Existing Go function
 boundaries and stack metadata remain authoritative. Unknown binaries or
 metadata layouts are refused rather than generalized from a profile.
 """
+import bisect
 import hashlib
 import io
 from pathlib import Path
-import subprocess
+import re
+import struct
 import tempfile
+from typing import TYPE_CHECKING, TypedDict, cast
 
 from elftools.elf.elffile import ELFFile
-from iced_x86 import Decoder, FlowControl, InstructionInfoFactory, Mnemonic, OpAccess, Register
+from elftools.elf.relocation import RelocationSection
+from elftools.elf.sections import SymbolTableSection
+from iced_x86 import (Decoder, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind,
+                      Register, RegisterExt)
 
-INPUT_SHA256 = 'baff3db5e4c09635709fa9838e4038c9b4f2c164ce7a80a18059393797d6802c'
+from . import assembler, go_runtime
+from .checked import unpack_ints
+from .go_runtime import AGY_SHA256
+
+if TYPE_CHECKING:
+    from .gometa import GoFunction, GoMetadata
+    from .go_runtime import InplaceRuntime
+
 START, END = 0x6811700, 0x68118c0
 PINNED = {
     'countbody': (START, END, '991fd3b836302bd34ec02a9c9b8f1197c9a589a4dae77b388a63db3573e8d2b2'),
@@ -101,7 +114,7 @@ countbody_end:
 '''
 
 
-def assemble(work=None):
+def assemble(work: str | Path | None = None) -> tuple[bytes, dict[str, int]]:
     """Return the audited 448-byte function and code/constants boundaries."""
     if work is None:
         with tempfile.TemporaryDirectory(prefix='penryn-countbody-') as temp:
@@ -110,20 +123,29 @@ def assemble(work=None):
     work.mkdir(parents=True, exist_ok=True)
     source, obj = work / 'countbody.S', work / 'countbody.o'
     source.write_text(ASSEMBLY)
-    subprocess.run(['cc', '-c', '-o', str(obj), str(source)], check=True, capture_output=True)
+    obj.write_bytes(assembler.assemble(ASSEMBLY))
     elf = ELFFile(io.BytesIO(obj.read_bytes()))
     for section in elf.iter_sections():
-        if section['sh_type'] in ('SHT_REL', 'SHT_RELA') and section.num_relocations():
-            raise ValueError('in-place countbody unexpectedly needs relocation')
-    symbols = {s.name: s['st_value'] for s in elf.get_section_by_name('.symtab').iter_symbols()}
-    body = elf.get_section_by_name('.text').data()
+        if section['sh_type'] in ('SHT_REL', 'SHT_RELA'):
+            if not isinstance(section, RelocationSection):
+                raise ValueError('in-place countbody relocation section is not an ELF relocation table')
+            if section.num_relocations():
+                raise ValueError('in-place countbody unexpectedly needs relocation')
+    symtab = elf.get_section_by_name('.symtab')
+    if not isinstance(symtab, SymbolTableSection):
+        raise ValueError('in-place countbody object has no ELF symbol table')
+    symbols = {s.name: s['st_value'] for s in symtab.iter_symbols()}
+    text = elf.get_section_by_name('.text')
+    if text is None:
+        raise ValueError('in-place countbody object has no .text section')
+    body = text.data()
     if len(body) > END - START or symbols['countbody'] != 0:
         raise ValueError('in-place countbody does not fit the original function')
     audit(body, symbols['countbody_code_end'], symbols['countbody_constants'])
     return body + b'\xcc' * (END - START - len(body)), symbols
 
 
-def audit(body, code_end, constants):
+def audit(body: bytes, code_end: int, constants: int) -> None:
     """Check stack neutrality, ISA, control flow and the limited write set."""
     instructions = list(Decoder(64, body[:code_end], ip=0))
     starts = {i.ip for i in instructions}
@@ -136,7 +158,6 @@ def audit(body, code_end, constants):
                Mnemonic.RET}
     allowed_registers = {Register.RBX, Register.RCX, Register.RDX, Register.RDI,
                          Register.R10, Register.R12, Register.ZMM0, Register.ZMM1}
-    from iced_x86 import RegisterExt
     writes = {OpAccess.WRITE, OpAccess.COND_WRITE, OpAccess.READ_WRITE, OpAccess.READ_COND_WRITE}
     for ins in instructions:
         if ins.is_invalid or ins.mnemonic not in allowed:
@@ -163,7 +184,7 @@ def audit(body, code_end, constants):
         raise ValueError('in-place function has no terminating return')
 
 
-def at_address(data, elf, start, end):
+def at_address(data: bytes, elf: ELFFile, start: int, end: int) -> bytes:
     mappings = [s for s in elf.iter_segments() if s['p_type'] == 'PT_LOAD'
                 and s['p_flags'] & 1 and s['p_vaddr'] <= start
                 and end <= s['p_vaddr'] + s['p_filesz']]
@@ -173,16 +194,41 @@ def at_address(data, elf, start, end):
     return data[offset:offset + end - start]
 
 
-def plan(data, elf, metadata, *, work=None):
+class InplaceEvidence(TypedDict):
+    recipe: str
+    input_sha256: str
+    original_sha256: str
+    replacement_sha256: str
+    function: str
+    end: int
+    original_metadata_preserved: bool
+    go_runtime: 'InplaceRuntime'
+    code_bytes: int
+    stack_delta: int
+    call_free: bool
+    clobbers: list[str]
+    input_contract: str
+
+
+class InplacePatch(TypedDict):
+    """Same-length replacement bytes for one pinned original function."""
+    address: int
+    original_bytes: bytes
+    replacement_bytes: bytes
+    covered_original_sites: list[int]
+    evidence: InplaceEvidence
+
+
+def plan(data: bytes, elf: ELFFile, metadata: 'GoMetadata', *, work: str | Path | None = None) -> list[InplacePatch]:
     """Return one verified recipe; metadata must include audited Go PC tables.
 
     This is deliberately opt-in and tied to an exact input payload. Function
     bytes alone cannot prove that a different executable has no new callers
     entering its interior, or that its runtime metadata has the same meaning.
     """
-    if hashlib.sha256(data).hexdigest() != INPUT_SHA256:
+    if hashlib.sha256(data).hexdigest() != AGY_SHA256:
         raise ValueError('Go in-place recipe supports only the pinned agy 1.2.7 payload')
-    functions = {f['name']: f for table in metadata.get('tables', []) for f in table['functions']
+    functions = {f['name']: f for table in metadata['tables'] for f in table['functions']
                  if f['name'] in PINNED}
     for name, (start, end, digest) in PINNED.items():
         function = functions.get(name)
@@ -192,7 +238,6 @@ def plan(data, elf, metadata, *, work=None):
             raise ValueError(f'changed pinned Go function bytes: {name}')
     # Parse the original runtime structures, not a caller-supplied boolean.
     # FuncFlagAsm disables asynchronous Go preemption in this pinned runtime.
-    from . import go_runtime
     runtime_evidence = go_runtime.Audit(data, elf, metadata).inplace('countbody')
     body, symbols = assemble(work)
     covered = START
@@ -208,7 +253,7 @@ def plan(data, elf, metadata, *, work=None):
         raise ValueError('pinned Go countbody instruction coverage changed')
     return [dict(address=START, original_bytes=original, replacement_bytes=body,
                  covered_original_sites=sites,
-                 evidence=dict(recipe='agy-1.2.7-countbody-sse2-v1', input_sha256=INPUT_SHA256,
+                 evidence=dict(recipe='agy-1.2.7-countbody-sse2-v1', input_sha256=AGY_SHA256,
                                original_sha256=PINNED['countbody'][2],
                                replacement_sha256=hashlib.sha256(body).hexdigest(),
                                function='countbody', end=END, original_metadata_preserved=True,
@@ -237,7 +282,7 @@ CRC_CALLS = {0x6a5daa0: 0x6a5e560, 0x6a5db00: 0x6a5e560,
              0x6a5de58: 0x6a5e620, 0x6a5df40: 0x6a5e560}
 
 
-def reachable(instructions, forced_edges=None):
+def reachable(instructions: list[Instruction], forced_edges: dict[int, int] | None = None) -> set[int]:
     """Conservative local CFG: both branch arms, calls return, no indirect jump.
 
     A forced edge represents a separately verified condition, never a profile.
@@ -274,9 +319,8 @@ def reachable(instructions, forced_edges=None):
     return visited
 
 
-def flag_false_edges(instructions, address):
+def flag_false_edges(instructions: list[Instruction], address: int) -> dict[int, int]:
     """Evaluate adjacent CMP byte [flag],0/1 and JE/JNE with flag known zero."""
-    from iced_x86 import OpKind
     result = {}
     for comparison, branch in zip(instructions, instructions[1:]):
         if not (comparison.mnemonic == Mnemonic.CMP and comparison.is_ip_rel_memory_operand
@@ -295,7 +339,8 @@ def flag_false_edges(instructions, address):
     return result
 
 
-def _closed_direct_references(data, elf, metadata, protected, helpers):
+def _closed_direct_references(data: bytes, elf: ELFFile, metadata: 'GoMetadata', protected: list[tuple[int, int]],
+                              helpers: set[int]) -> list[tuple[int, int]]:
     """Audit ordinary Go code-address representations in the exact input.
 
     The pinned Go assembler/compiler uses rel32 branches and RIP-relative LEA
@@ -303,14 +348,13 @@ def _closed_direct_references(data, elf, metadata, protected, helpers):
     all executable sections, including non-Go callers. Any unresolved incoming
     branch or escaped helper address refuses this recipe.
     """
-    import bisect
-    import re
-    import struct
-    functions = sorted((f for t in metadata['tables'] for f in t['functions']), key=lambda f: f['start'])
+    def function_start(f: 'GoFunction') -> int:
+        return f['start']
+    functions = sorted((f for t in metadata['tables'] for f in t['functions']), key=function_start)
     starts = [f['start'] for f in functions]
-    decoded = {}
+    decoded: dict[int, dict[int, Instruction]] = {}
 
-    def actual(pc):
+    def actual(pc: int) -> Instruction | None:
         index = bisect.bisect_right(starts, pc) - 1
         if index < 0 or pc >= functions[index]['end']:
             raise ValueError('unresolved non-Go reference into guarded Go code')
@@ -319,7 +363,7 @@ def _closed_direct_references(data, elf, metadata, protected, helpers):
             decoded[f['start']] = {i.ip: i for i in Decoder(64, at_address(data, elf, f['start'], f['end']), ip=f['start'])}
         return decoded[f['start']].get(pc)
 
-    def owner(address):
+    def owner(address: int) -> tuple[int, int] | None:
         return next((r for r in protected if r[0] <= address < r[1]), None)
 
     calls = {}
@@ -333,7 +377,8 @@ def _closed_direct_references(data, elf, metadata, protected, helpers):
         base = section['sh_addr']
         for match in direct.finditer(blob):
             pc = base + match.start()
-            target = pc + len(match[1]) + 4 + struct.unpack('<i', match[2])[0]
+            # Both lookahead groups always participate in a match.
+            target = pc + len(cast(bytes, match[1])) + 4 + unpack_ints('<i', cast(bytes, match[2]))[0]
             dest = owner(target)
             if dest is None:
                 continue
@@ -350,7 +395,7 @@ def _closed_direct_references(data, elf, metadata, protected, helpers):
         # rel8 branches can cross a function boundary only within 128 bytes.
         # Inspect these windows rather than scanning every short branch in the
         # complete executable a second time.
-        windows = set()
+        windows: set[int] = set()
         for begin, end in protected:
             left, right = max(base, begin - 130), min(base + len(blob), end + 130)
             if left < right:
@@ -376,7 +421,7 @@ def _closed_direct_references(data, elf, metadata, protected, helpers):
                 calls[pc] = target
         for match in lea.finditer(blob):
             pc = base + match.start()
-            target = pc + len(match[1]) + 4 + struct.unpack('<i', match[2])[0]
+            target = pc + len(cast(bytes, match[1])) + 4 + unpack_ints('<i', cast(bytes, match[2]))[0]
             dest = owner(target)
             if dest is None:
                 continue
@@ -395,16 +440,59 @@ def _closed_direct_references(data, elf, metadata, protected, helpers):
     return sorted(calls.items())
 
 
-def dormant(data, elf, metadata):
+class CpuidProof(TypedDict):
+    leaf: int
+    register: str
+    bit: int
+    target_value: int
+    assignment: int
+    implementation: int
+
+
+class OptionsProof(TypedDict):
+    function: str
+    store: int
+    enabling_requires_existing_true: bool
+
+
+class DispatchEvidence(TypedDict):
+    recipe: str
+    input_sha256: str
+    classification: str
+    target_cpu: str
+    feature: str
+    flag_address: int
+    initial_value: int
+    cpuid: CpuidProof
+    options: OptionsProof
+    crc_callers: list[tuple[int, int]]
+    flag_references: list[int]
+    function_sha256: dict[str, str]
+    proof_scope: str
+    uses_profile: bool
+
+
+class DormantEvidence(DispatchEvidence):
+    function: str
+
+
+class DormantSite(TypedDict):
+    """One original instruction left in place on a proven-unreachable path."""
+    address: int
+    original_bytes: bytes
+    evidence: DormantEvidence
+
+
+def dormant(data: bytes, elf: ELFFile, metadata: 'GoMetadata') -> list[DormantSite]:
     """Return 18 proven-unreachable SSE4.2 sites for the exact Penryn target.
 
     The remaining AVX512 FilterNil POPCNT is deliberately not classified: an
     unaligned absolute wrapper-address literal has no validated interpretation.
     This API raises on unknown inputs instead of trusting zero dynamic counts.
     """
-    if hashlib.sha256(data).hexdigest() != INPUT_SHA256:
+    if hashlib.sha256(data).hexdigest() != AGY_SHA256:
         raise ValueError('Go dispatch proof supports only the pinned agy 1.2.7 payload')
-    functions = {f['name']: f for t in metadata.get('tables', []) for f in t['functions']}
+    functions = {f['name']: f for t in metadata['tables'] for f in t['functions']}
     decoded = {}
     for name, (start, end, digest) in DISPATCH_PINNED.items():
         f = functions.get(name)
@@ -439,7 +527,6 @@ def dormant(data, elf, metadata):
     # Audit the private capability byte's code references too. Its address
     # escapes only once, into internal/cpu's pinned option record. The pinned
     # processOptions implementation above is that record's monotone writer.
-    import struct
     flag_references = {}
     for section in elf.iter_sections():
         if section['sh_type'] == 'SHT_NOBITS' or not section['sh_flags'] & 4:
@@ -452,17 +539,17 @@ def dormant(data, elf, metadata):
                                 0x6a5dbc2: Mnemonic.CMP, 0x6a5e2fd: Mnemonic.CMP}
     if flag_references != expected_flag_references or struct.pack('<I', SSE42_FLAG) in data:
         raise ValueError('CPU capability has an unaudited address reference')
-    evidence = dict(recipe='agy-1.2.7-go-sse42-dispatch-v1', input_sha256=INPUT_SHA256,
-                    classification='cpu-dispatch-unreachable', target_cpu='Penryn',
-                    feature='SSE4.2', flag_address=SSE42_FLAG, initial_value=0,
-                    cpuid=dict(leaf=1, register='ecx', bit=20, target_value=0,
-                               assignment=0x68024c8, implementation=0x6802c20),
-                    options=dict(function='internal/cpu.processOptions', store=0x6801b6a,
-                                 enabling_requires_existing_true=True),
-                    crc_callers=closure, flag_references=sorted(flag_references), function_sha256={n: p[2] for n, p in DISPATCH_PINNED.items()},
-                    proof_scope='exact input, Go rel8/rel32/LEA/absolute-pointer address representations',
-                    uses_profile=False)
-    rows = []
+    evidence: DispatchEvidence = dict(recipe='agy-1.2.7-go-sse42-dispatch-v1', input_sha256=AGY_SHA256,
+                                      classification='cpu-dispatch-unreachable', target_cpu='Penryn',
+                                      feature='SSE4.2', flag_address=SSE42_FLAG, initial_value=0,
+                                      cpuid=dict(leaf=1, register='ecx', bit=20, target_value=0,
+                                                 assignment=0x68024c8, implementation=0x6802c20),
+                                      options=dict(function='internal/cpu.processOptions', store=0x6801b6a,
+                                                   enabling_requires_existing_true=True),
+                                      crc_callers=closure, flag_references=sorted(flag_references), function_sha256={n: p[2] for n, p in DISPATCH_PINNED.items()},
+                                      proof_scope='exact input, Go rel8/rel32/LEA/absolute-pointer address representations',
+                                      uses_profile=False)
+    rows: list[DormantSite] = []
     for name in ('indexbody', 'hash/crc32.castagnoliSSE42', 'hash/crc32.castagnoliSSE42Triple'):
         for ins in decoded[name]:
             if ins.mnemonic not in (Mnemonic.CRC32, Mnemonic.PCMPESTRI):
@@ -470,7 +557,7 @@ def dormant(data, elf, metadata):
             if name in safe and ins.ip in safe[name]:
                 raise ValueError('unsupported instruction remains reachable with SSE4.2 unavailable')
             rows.append(dict(address=ins.ip, original_bytes=at_address(data, elf, ins.ip, ins.next_ip),
-                             evidence=dict(evidence, function=name)))
+                             evidence={**evidence, 'function': name}))
     if len(rows) != 18:
         raise ValueError('guarded SSE4.2 site set changed')
     return rows

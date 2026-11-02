@@ -13,18 +13,229 @@ from pathlib import Path
 import struct
 import subprocess
 import tempfile
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, overload
 
+from elftools.elf.dynamic import DynamicSection
 from elftools.elf.elffile import ELFFile
-from iced_x86 import Decoder, InstructionInfoFactory, Mnemonic, OpAccess, Register, RegisterExt, FlowControl, EncodingKind, Code
+from elftools.elf.sections import SymbolTableSection
+from iced_x86 import (Code, Decoder, EncodingKind, FlowControl, InstructionInfoFactory, Mnemonic, OpAccess,
+                      OpKind, Register, RegisterExt)
+
+from .assembler import assemble
+from .checked import iter_ints, unpack_ints
+
+if TYPE_CHECKING:
+    from .gometa import GoFunction, GoMetadata, GoTable
 
 AGY_SHA256 = 'baff3db5e4c09635709fa9838e4038c9b4f2c164ce7a80a18059393797d6802c'
+AGY_PROFILE = 'agy-1.2.7-go1.28-20260721-RC03-pinned'
+# The fixed fields of Go's _func record, in order.
+_FUNC = '<IiiIIIIIIiBBBB'
 
 
 class Unsupported(ValueError):
     """The original program or requested replacement is outside the proof."""
 
 
-def uvarint(data, offset):
+# Decoded Go PC value table: [begin, end) PC intervals and their values.
+type PCValues = list[tuple[int, int, int]]
+
+
+class AuditFunction(TypedDict):
+    """A Go function with its original _func fields and decoded PC tables."""
+    start: int
+    end: int
+    name: str
+    metadata_address: int
+    args: int
+    deferreturn: int
+    pcsp_offset: int
+    pcsp: PCValues
+    pcfile: PCValues
+    pcln: PCValues
+    pcdata: list[PCValues]
+    cu_offset: int
+    start_line: int
+    func_id: int
+    func_flag: int
+    funcdata: list[int]
+    table: 'GoTable'
+
+
+class GoSite(TypedDict):
+    """The original Go metadata in force at one PC."""
+    function: str
+    start: int
+    end: int
+    pcsp: int
+    pcfile: int
+    pcln: int
+    pcdata: list[int]
+    funcdata: list[int]
+    args: int
+    cu_offset: int
+    start_line: int
+    func_id: int
+    func_flag: int
+    layout_profile: str | None
+    abi_internal: bool
+    continuation: NotRequired[int]
+
+
+class LayoutProfile(TypedDict):
+    """A supported runtime.moduledata layout; _profile adds the located module."""
+    name: str
+    size: int
+    next: int
+    textsectmap: int
+    gofunc: int
+    hasmain: int
+    gcdatamask: int
+    gcbssmask: int
+    abi_internal: bool
+    module: NotRequired[int]
+    lastmoduledatap: NotRequired[int]
+    gofunc_address: NotRequired[int]
+    rejected_candidates: NotRequired[list[str]]
+
+
+class CandidateProvenance(TypedDict):
+    address: NotRequired[int]
+    reason: str
+    references: NotRequired[list[int]]
+    classification: str
+    evidence: NotRequired[str]
+
+
+class InplaceRuntime(TypedDict):
+    layout_profile: str
+    function: str
+    func_flag: int
+    func_id: int
+    pcsp: PCValues
+    pcdata: list[PCValues]
+    asm_disables_async_preemption: bool
+    inplace_stack_neutral_verified: bool
+
+
+class StartupEntry(TypedDict):
+    kind: str
+    entry: int
+    call: int
+    import_name: str
+    init_argument: int
+
+
+class LoaderPatch(TypedDict):
+    """Replace old with new at a file offset of the original image."""
+    offset: int
+    old: bytes
+    new: bytes
+
+
+class PreinitEvidence(TypedDict):
+    kind: str
+    array: int
+    array_bytes: int
+    original_first_callback: int
+    original_second_callback: int
+    initializer: int
+    relocation_addend_offset: int
+    raw_slots_unchanged: bool
+
+
+class PreinitRegistration(TypedDict):
+    target: int
+    patches: list[LoaderPatch]
+    evidence: PreinitEvidence
+
+
+class LegacyInitEvidence(TypedDict):
+    kind: str
+    address: int
+    callback: int
+    original_target: int
+    initializer: int
+    original_bytes: str
+    replacement_bytes: str
+
+
+class LegacyInitPatch(LoaderPatch):
+    evidence: LegacyInitEvidence
+
+
+class TypelinksEvidence(TypedDict):
+    kind: str
+    address: int
+    original_slot: int
+    replacement_slot: int
+    branch: int
+    fast_return: int
+    modified_bytes: int
+    type_fields_and_fixups_empty: bool
+    original_module_count: int
+    synthetic_is_published_tail: bool
+    future_module_append: str
+
+
+class TypelinksPatch(LoaderPatch):
+    evidence: TypelinksEvidence
+
+
+class StubRange(TypedDict):
+    """One emitted Go stub and the single original instruction it replaces."""
+    start: int
+    end: int
+    original_pc: int
+    continuation: int
+    code: bytes
+
+
+class RangeCoverage(TypedDict):
+    start: int
+    end: int
+    original_pc: int
+    original_function: str
+    pcsp: int
+    unsafe_point: int
+    func_flag: int
+    pointer_maps: str
+    stack_bytes_added: int
+    original_call_frame: bool
+
+
+class RegistrationReport(TypedDict):
+    layout_profile: str
+    registration: str
+    original_module: int
+    module_address: int
+    text_start: int
+    text_end: int
+    metadata_bytes: int
+    legacy_init_hook: LegacyInitEvidence | None
+    startup_entry: StartupEntry | None
+    preinit_hook: PreinitEvidence | None
+    typelinks_fast_path: TypelinksEvidence | None
+    constructor_bytes: int
+    ranges: list[RangeCoverage]
+    coverage_complete: bool
+    constructor_frame: str
+    stack_growth: str
+    preemption: str
+    source_locations: str
+
+
+class BuildResult(TypedDict):
+    blob: bytes
+    alignment: int
+    constructor_bytes: bytes
+    patches: list[LoaderPatch]
+    constructor_elf: str | None
+    constructor_elf_data: bytes
+    report: RegistrationReport
+
+
+def uvarint(data: bytes, offset: int) -> tuple[int, int]:
     value = 0
     for shift in range(0, 35, 7):
         if offset >= len(data):
@@ -39,7 +250,7 @@ def uvarint(data, offset):
     raise Unsupported('overflow in Go PC value table')
 
 
-def putvarint(value):
+def putvarint(value: int) -> bytearray:
     if not 0 <= value <= 0xffffffff:
         raise Unsupported('Go PC value exceeds uint32')
     result = bytearray()
@@ -50,7 +261,7 @@ def putvarint(value):
     return result
 
 
-def pcvalues(data, offset, start, end):
+def pcvalues(data: bytes, offset: int, start: int, end: int) -> PCValues:
     """Decode Go runtime.step's signed value deltas and unsigned PC deltas."""
     if offset == 0:
         return [(start, end, -1)]
@@ -76,29 +287,31 @@ def pcvalues(data, offset, start, end):
     return result
 
 
-def constpc(value, length):
+def constpc(value: int, length: int) -> bytes:
     delta = value + 1
     encoded = (-delta * 2 - 1) if delta < 0 else delta * 2
     return bytes(putvarint(encoded) + putvarint(length) + b'\0')
 
 
 class Audit:
-    def __init__(self, data, elf, metadata):
+    def __init__(self, data: bytes, elf: ELFFile, metadata: 'GoMetadata') -> None:
         self.data, self.elf, self.metadata = data, elf, metadata
         self.segments = [p for p in elf.iter_segments() if p['p_type'] == 'PT_LOAD']
-        self.relative = {}
+        self.relative: dict[int, int] = {}
         for section in elf.iter_sections():
             if section['sh_type'] == 'SHT_RELA' and section['sh_flags'] & 2:
                 raw = section.data()
                 if len(raw) % 24:
                     raise Unsupported('malformed ELF RELA section')
-                self.relative.update({a: c for a, b, c in struct.iter_unpack('<QQq', raw) if b == 8})
-        self.functions = sorted((f for t in metadata.get('tables', []) for f in t['functions']), key=lambda f: f['start'])
+                self.relative.update({a: c for a, b, c in iter_ints('<QQq', raw) if b == 8})
+        def function_start(f: 'GoFunction') -> int:
+            return f['start']
+        self.functions = sorted((f for t in metadata['tables'] for f in t['functions']), key=function_start)
         self.starts = [f['start'] for f in self.functions]
-        self.tables = metadata.get('tables', [])
-        self.cache = {}
-        self.profile = None
-        self.profile_error = None
+        self.tables = metadata['tables']
+        self.cache: dict[int, AuditFunction] = {}
+        self.profile: LayoutProfile | None = None
+        self.profile_error: str | None = None
         if len(self.tables) != 1:
             self.profile_error = 'exactly one original Go module is required'
         else:
@@ -108,14 +321,14 @@ class Audit:
                 self.profile_error = str(error)
         self.candidate_provenance = self._candidate_provenance()
 
-    def _candidate_provenance(self):
-        result = []
-        for reason in self.metadata.get("rejected_candidates", []):
+    def _candidate_provenance(self) -> list[CandidateProvenance]:
+        result: list[CandidateProvenance] = []
+        for reason in self.metadata["rejected_candidates"]:
             match = re.match(r"0x([0-9a-f]+):", reason)
             if not match:
                 result.append(dict(reason=reason, classification="unresolved"))
                 continue
-            address = int(match.group(1), 16)
+            address = int(cast(str, match.group(1)), 16)
             refs = {slot for slot, value in self.relative.items() if value == address}
             needle = struct.pack("<Q", address)
             for section in self.elf.iter_sections():
@@ -136,20 +349,23 @@ class Audit:
                                evidence="all allocated non-executable aligned pointer words and RELATIVE relocations inspected"))
         return result
 
-    def offset(self, address, size=1):
+    def offset(self, address: int, size: int = 1) -> int:
         for segment in self.segments:
             if segment['p_vaddr'] <= address and address + size <= segment['p_vaddr'] + segment['p_filesz']:
                 return segment['p_offset'] + address - segment['p_vaddr']
         raise Unsupported(f'Go metadata address 0x{address:x} is not file backed')
 
-    def read(self, address, size):
+    def read(self, address: int, size: int) -> bytes:
         at = self.offset(address, size)
         return self.data[at:at + size]
 
-    def word(self, address):
-        return self.relative.get(address, struct.unpack('<Q', self.read(address, 8))[0])
+    def word(self, address: int) -> int:
+        # The loader writes a RELATIVE relocation's value, file-backed or not.
+        if address in self.relative:
+            return self.relative[address]
+        return unpack_ints('<Q', self.read(address, 8))[0]
 
-    def function(self, pc):
+    def function(self, pc: int) -> AuditFunction:
         index = bisect_right(self.starts, pc) - 1
         if index < 0 or pc >= self.functions[index]['end']:
             raise Unsupported('PC has no verified Go function')
@@ -158,16 +374,11 @@ class Audit:
             return self.cache[f['start']]
         table = next(t for t in self.tables if t['functions'][0]['start'] <= pc < t['functions'][-1]['end'])
         header = self.read(table['address'], 72)
-        offsets = struct.unpack_from('<5Q', header, 32)
+        offsets = unpack_ints('<5Q', header, 32)
         pctab = self.read(table['address'] + offsets[3], offsets[4] - offsets[3])
-        address = f.get('metadata_address')
-        if address is None:
-            # Backwards compatible with reports made by the original helper.
-            local = bisect_right([x['start'] for x in table['functions']], f['start']) - 1
-            item = self.read(table['address'] + offsets[4] + local * 8, 8)
-            address = table['address'] + offsets[4] + struct.unpack_from('<I', item, 4)[0]
+        address = f['metadata_address']
         raw = self.read(address, 44)
-        fields = struct.unpack('<Ii i IIIIII i BBBB'.replace(' ', ''), raw)
+        fields = unpack_ints(_FUNC, raw)
         entry, name, args, deferreturn, pcsp, pcfile, pcln, npcdata, cuoffset, line, funcid, flag, pad, nfuncdata = fields
         if entry + table['text'] != f['start'] or not 0 <= name < offsets[1] - offsets[0] or pad != 0 or npcdata > 16 or nfuncdata > 16:
             raise Unsupported('Go _func fixed layout validation failed')
@@ -175,20 +386,20 @@ class Audit:
         if original_name != f['name'].encode() + b'\0':
             raise Unsupported('Go _func name disagrees with debug/gosym')
         tail = self.read(address + 44, 4 * (npcdata + nfuncdata))
-        items = struct.unpack(f'<{npcdata + nfuncdata}I', tail) if tail else ()
+        items = unpack_ints(f'<{npcdata + nfuncdata}I', tail) if tail else ()
         pcd = [pcvalues(pctab, v, f['start'], f['end']) for v in items[:npcdata]]
-        out = dict(f, metadata_address=address, args=args, deferreturn=deferreturn,
-                   pcsp_offset=pcsp, pcsp=pcvalues(pctab, pcsp, f['start'], f['end']),
-                   pcfile=pcvalues(pctab, pcfile, f['start'], f['end']),
-                   pcln=pcvalues(pctab, pcln, f['start'], f['end']), pcdata=pcd,
-                   cu_offset=cuoffset, start_line=line, func_id=funcid, func_flag=flag,
-                   funcdata=list(items[npcdata:]), table=table)
+        out: AuditFunction = {**f, 'metadata_address': address, 'args': args, 'deferreturn': deferreturn,
+                              'pcsp_offset': pcsp, 'pcsp': pcvalues(pctab, pcsp, f['start'], f['end']),
+                              'pcfile': pcvalues(pctab, pcfile, f['start'], f['end']),
+                              'pcln': pcvalues(pctab, pcln, f['start'], f['end']), 'pcdata': pcd,
+                              'cu_offset': cuoffset, 'start_line': line, 'func_id': funcid, 'func_flag': flag,
+                              'funcdata': list(items[npcdata:]), 'table': table}
         self.cache[f['start']] = out
         return out
 
-    def site(self, pc):
+    def site(self, pc: int) -> GoSite:
         f = self.function(pc)
-        def value(rows):
+        def value(rows: PCValues) -> int:
             for begin, end, result in rows:
                 if begin <= pc < end:
                     return result
@@ -203,7 +414,7 @@ class Audit:
                     layout_profile=self.profile['name'] if self.profile else None,
                     abi_internal=self.abi_internal(f))
 
-    def replacement_site(self, pc):
+    def replacement_site(self, pc: int) -> GoSite:
         """Check source-side constraints before selecting a Go lowering."""
         if not self.profile:
             raise Unsupported(self.profile_error or 'Go runtime layout is unverified')
@@ -223,11 +434,11 @@ class Audit:
         site['continuation'] = original.next_ip
         return site
 
-    def abi_internal(self, function):
+    def abi_internal(self, function: AuditFunction) -> bool:
         return bool(self.profile and self.profile.get('abi_internal') and function['func_flag'] == 0
                     and function['func_id'] == 0 and not function['name'].endswith('.abi0'))
 
-    def inplace(self, name):
+    def inplace(self, name: str) -> InplaceRuntime:
         f = next((f for f in self.functions if f['name'] == name), None)
         if not f:
             raise Unsupported('in-place function is missing from Go metadata')
@@ -244,7 +455,7 @@ class Audit:
                     func_id=0, pcsp=detail['pcsp'], pcdata=detail['pcdata'],
                     asm_disables_async_preemption=True, inplace_stack_neutral_verified=True)
 
-    def _profile(self):
+    def _profile(self) -> LayoutProfile:
         table = self.tables[0]
         module = table.get('module_address', 0)
         if not module:
@@ -252,6 +463,8 @@ class Audit:
             if self.elf['e_type'] == 'ET_EXEC':
                 symbol = self.elf.get_section_by_name('.symtab')
                 if symbol:
+                    if not isinstance(symbol, SymbolTableSection):
+                        raise ValueError('.symtab is not an ELF symbol table')
                     candidates += [s['st_value'] for s in symbol.iter_symbols() if s.name == 'runtime.firstmoduledata']
             candidates = [a for a in candidates if self._prefix(a, table)]
             if len(candidates) != 1:
@@ -262,9 +475,9 @@ class Audit:
         version = self.metadata.get('go_build_version', '')
         digest = hashlib.sha256(self.data).hexdigest()
         if digest == AGY_SHA256:
-            profile = dict(name='agy-1.2.7-go1.28-20260721-RC03-pinned', size=568,
-                           next=560, textsectmap=360, gofunc=344, hasmain=512,
-                           gcdatamask=520, gcbssmask=536, abi_internal=False)
+            profile: LayoutProfile = dict(name=AGY_PROFILE, size=568,
+                                          next=560, textsectmap=360, gofunc=344, hasmain=512,
+                                          gcdatamask=520, gcbssmask=536, abi_internal=False)
             # The complete input digest pins every consumer of this private ABI.
             # Runtime findfunc and modulesinit independently use next+0x230.
             if module != 0xbcc95e0 or b'go1.28-20260721-RC03' not in self.data:
@@ -281,20 +494,22 @@ class Audit:
         refs = [a for a, value in self.relative.items() if value == module]
         symbols = self.elf.get_section_by_name('.symtab')
         if symbols:
+            if not isinstance(symbols, SymbolTableSection):
+                raise ValueError('.symtab is not an ELF symbol table')
             named = [s['st_value'] for s in symbols.iter_symbols() if s.name == 'runtime.lastmoduledatap']
             if named:
                 refs = named
         if len(refs) != 1 or self.word(refs[0]) != module:
             raise Unsupported('cannot identify unique original runtime.lastmoduledatap')
-        profile.update(module=module, lastmoduledatap=refs[0], gofunc_address=self.word(module + profile['gofunc']))
+        profile.update({'module': module, 'lastmoduledatap': refs[0], 'gofunc_address': self.word(module + profile['gofunc'])})
         # Header-bearing module is the only supported linked module. Unreferenced
         # magic strings are reported separately; they cannot veto verified code.
-        profile['rejected_candidates'] = self.metadata.get('rejected_candidates', [])
+        profile['rejected_candidates'] = self.metadata['rejected_candidates']
         return profile
 
-    def _prefix(self, address, table):
+    def _prefix(self, address: int, table: 'GoTable') -> bool:
         try:
-            offsets = struct.unpack_from('<5Q', self.read(table['address'], 72), 32)
+            offsets = unpack_ints('<5Q', self.read(table['address'], 72), 32)
             return (self.word(address) == table['address'] and
                     all(self.word(address + field) == table['address'] + offset
                         for field, offset in zip((8, 32, 56, 80, 104, 128), (*offsets, offsets[-1]))) and
@@ -304,25 +519,33 @@ class Audit:
         except Unsupported:
             return False
 
-    def _verify_dwarf_layout(self, profile):
+    def _verify_dwarf_layout(self, profile: LayoutProfile) -> None:
         # Go's ABIInternal is not a public binary ABI. Accept an exact release
         # family only after the binary's own DWARF confirms its private layout.
+        layout_fields: tuple[Literal['next', 'textsectmap', 'gofunc', 'hasmain', 'gcdatamask', 'gcbssmask'], ...] = (
+            'next', 'textsectmap', 'gofunc', 'hasmain', 'gcdatamask', 'gcbssmask')
         dwarf = self.elf.get_dwarf_info(relocate_dwarf_sections=False, follow_links=False)
         for unit in dwarf.iter_CUs():
             for die in unit.iter_DIEs():
                 name = die.attributes.get('DW_AT_name')
                 if die.tag != 'DW_TAG_structure_type' or not name or name.value != b'runtime.moduledata':
                     continue
-                fields = {d.attributes['DW_AT_name'].value.decode(): d.attributes['DW_AT_data_member_location'].value
+                fields = {_dwarf_string(d.attributes['DW_AT_name'].value): d.attributes['DW_AT_data_member_location'].value
                           for d in die.iter_children() if d.tag == 'DW_TAG_member'}
                 if (die.attributes['DW_AT_byte_size'].value != profile['size'] or
-                    any(fields.get(key) != profile[key] for key in ('next', 'textsectmap', 'gofunc', 'hasmain', 'gcdatamask', 'gcbssmask'))):
+                    any(fields.get(key) != profile[key] for key in layout_fields)):
                     raise Unsupported('Go moduledata DWARF layout differs from supported profile')
                 return
         raise Unsupported('Go release profile requires self-contained moduledata DWARF')
 
 
-def validate_code(code, start, end, continuation):
+def _dwarf_string(value: object) -> str:
+    if not isinstance(value, bytes):
+        raise ValueError('Go moduledata DWARF member name is not a byte string')
+    return value.decode()
+
+
+def validate_code(code: bytes, start: int, end: int, continuation: int) -> None:
     """Independent structural audit; lowering additionally proves scratch saves."""
     if len(code) != end - start:
         raise Unsupported('Go stub range does not match emitted bytes')
@@ -352,25 +575,35 @@ def validate_code(code, start, end, continuation):
         raise Unsupported('Go stub lacks a direct continuation jump')
 
 
-def _assemble(source, address, work=None, with_elf=False):
+@overload
+def _assemble(source: str, address: int, work: str | Path | None = None, with_elf: Literal[False] = False) -> bytes: ...
+@overload
+def _assemble(source: str, address: int, work: str | Path | None = None, *, with_elf: Literal[True]) -> tuple[bytes, bytes]: ...
+@overload
+def _assemble(source: str, address: int, work: str | Path | None = None, with_elf: bool = False) -> bytes | tuple[bytes, bytes]: ...
+def _assemble(source: str, address: int, work: str | Path | None = None, with_elf: bool = False) -> bytes | tuple[bytes, bytes]:
     if work is None:
         with tempfile.TemporaryDirectory(prefix='penryn-go-init-') as temp:
             return _assemble(source, address, Path(temp), with_elf=with_elf)
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
     assembly, obj, linked = work / 'go-init.S', work / 'go-init.o', work / 'go-init.elf'
-    definitions = re.findall(r'^\.set (\w+), (\d+)$', source, flags=re.M)
+    # Two groups that always participate: findall yields (name, value) pairs.
+    definitions = cast(list[tuple[str, str]], re.findall(r'^\.set (\w+), (\d+)$', source, flags=re.M))
     source = re.sub(r'^\.set (\w+), (\d+)$', r'.extern \1', source, flags=re.M)
     assembly.write_text(source)
-    subprocess.run(['cc', '-c', '-o', str(obj), str(assembly)], check=True, capture_output=True)
+    obj.write_bytes(assemble(source))
     subprocess.run(['ld', '-m', 'elf_x86_64', '-Ttext', hex(address), '-e', 'go_init',
                     '-o', str(linked), str(obj), *[f'--defsym={key}={value}' for key, value in definitions]], check=True, capture_output=True)
     elf = ELFFile(io.BytesIO(linked.read_bytes()))
-    code = elf.get_section_by_name('.text').data()
+    section = elf.get_section_by_name('.text')
+    if section is None:
+        raise ValueError('assembled Go initializer has no .text section')
+    code = section.data()
     return (code, linked.read_bytes()) if with_elf else code
 
 
-def verify_dynamic_init_entry(audit):
+def verify_dynamic_init_entry(audit: Audit) -> StartupEntry:
     """Require a direct CRT path passing null init to __libc_start_main.
 
     Modern glibc selects DT_INIT only when its fourth argument is null. A
@@ -403,7 +636,6 @@ def verify_dynamic_init_entry(audit):
         if any(RegisterExt.full_register(reg.register) == Register.RSP and reg.access in writes for reg in info.used_registers()):
             valid_stack = ins.mnemonic == Mnemonic.PUSH or (ins.mnemonic == Mnemonic.POP and ins.op0_register != Register.RSP)
             if ins.mnemonic == Mnemonic.AND and ins.op0_register == Register.RSP:
-                from iced_x86 import OpKind
                 valid_stack = ins.op1_kind in (OpKind.IMMEDIATE8TO64, OpKind.IMMEDIATE32TO64) and ins.immediate(1) == 0xfffffffffffffff0
             if not valid_stack:
                 raise Unsupported('dynamic Go CRT changes its initial stack unexpectedly')
@@ -414,7 +646,6 @@ def verify_dynamic_init_entry(audit):
             if ins.mnemonic == Mnemonic.MOV and ins.op0_register in (Register.RCX, Register.ECX):
                 # The ordinary CRT uses XOR. No inference is made from memory,
                 # another register, or a partial-register write.
-                from iced_x86 import OpKind
                 zero_rcx = ins.op1_kind in (OpKind.IMMEDIATE32, OpKind.IMMEDIATE32TO64, OpKind.IMMEDIATE64) and ins.immediate(1) == 0
     if first_call is None or not zero_rcx:
         raise Unsupported('dynamic Go CRT does not prove a null legacy init callback')
@@ -424,20 +655,24 @@ def verify_dynamic_init_entry(audit):
         if section['sh_type'] != 'SHT_RELA' or not section['sh_flags'] & 2:
             continue
         symbols = audit.elf.get_section(section['sh_link'])
-        for address, info, addend in struct.iter_unpack('<QQq', section.data()):
-            if address == got and info & 0xffffffff in (6, 7):
-                targets.append(symbols.get_symbol(info >> 32).name)
+        for address, r_info, _ in iter_ints('<QQq', section.data()):
+            if address == got and r_info & 0xffffffff in (6, 7):
+                if not isinstance(symbols, SymbolTableSection):
+                    raise ValueError('GOT relocation section does not link an ELF symbol table')
+                targets.append(symbols.get_symbol(r_info >> 32).name)
     if targets != ['__libc_start_main']:
         raise Unsupported('dynamic Go CRT call is not uniquely relocated to __libc_start_main')
     return dict(kind='verified-null-libc-start-main-init', entry=entry,
                 call=first_call.ip, import_name='__libc_start_main', init_argument=0)
 
 
-def preinit_registration(audit, installer_va):
+def preinit_registration(audit: Audit, installer_va: int) -> PreinitRegistration | None:
     """Register before agy's first preinit callback; reject unknown preinit code."""
     dynamic = audit.elf.get_section_by_name('.dynamic')
     if dynamic is None:
         return None
+    if not isinstance(dynamic, DynamicSection):
+        raise ValueError('.dynamic is not an ELF dynamic section')
     pointers = [tag.entry.d_val for tag in dynamic.iter_tags() if tag.entry.d_tag == 'DT_PREINIT_ARRAY']
     sizes = [tag.entry.d_val for tag in dynamic.iter_tags() if tag.entry.d_tag == 'DT_PREINIT_ARRAYSZ']
     if not pointers and not sizes:
@@ -446,7 +681,9 @@ def preinit_registration(audit, installer_va):
         raise Unsupported('ambiguous or incomplete Go executable preinit array')
     if sizes[0] == 0:
         return None
-    if audit.profile['name'] != 'agy-1.2.7-go1.28-20260721-RC03-pinned':
+    if audit.profile is None:
+        raise ValueError('Go preinit registration requires a verified runtime layout')
+    if audit.profile['name'] != AGY_PROFILE:
         raise Unsupported('nonempty preinit array may execute Go before DT_INIT registration')
     if pointers != [0x9f45840] or sizes != [16]:
         raise Unsupported('pinned agy preinit array changed')
@@ -455,7 +692,7 @@ def preinit_registration(audit, installer_va):
     for section in audit.elf.iter_sections():
         if section['sh_type'] != 'SHT_RELA' or not section['sh_flags'] & 2:
             continue
-        for index, (address, info, addend) in enumerate(struct.iter_unpack('<QQq', section.data())):
+        for index, (address, info, addend) in enumerate(iter_ints('<QQq', section.data())):
             if address not in slots:
                 continue
             if address in found or info != 8 or addend != slots[address]:
@@ -476,10 +713,10 @@ def preinit_registration(audit, installer_va):
                               relocation_addend_offset=found[0x9f45840], raw_slots_unchanged=True))
 
 
-def checked_init_call_patch(audit, address, original_target, installer_va):
+def checked_init_call_patch(audit: Audit, address: int, original_target: int, installer_va: int) -> LoaderPatch:
     """Patch one already-identified direct initializer call, checking its target."""
     original = audit.read(address, 5)
-    if len(original) != 5 or original[0] != 0xe8 or address + 5 + struct.unpack_from('<i', original, 1)[0] != original_target:
+    if len(original) != 5 or original[0] != 0xe8 or address + 5 + unpack_ints('<i', original, 1)[0] != original_target:
         raise Unsupported('verified legacy init call bytes/target changed')
     displacement = installer_va - address - 5
     if not -(1 << 31) <= displacement < (1 << 31):
@@ -488,14 +725,16 @@ def checked_init_call_patch(audit, address, original_target, installer_va):
     return dict(offset=audit.offset(address, 5), old=original, new=replacement)
 
 
-def legacy_init_patch(audit, original_init, installer_va):
+def legacy_init_patch(audit: Audit, original_init: int, installer_va: int) -> LegacyInitPatch | None:
     """Redirect agy's pinned pre-glibc-2.34 CRT initializer call.
 
     A non-null init callback passed to __libc_start_main bypasses DT_INIT for
     the main executable. Its direct call must therefore reach the new wrapper.
     This is deliberately an exact-input recipe, not a CRT-pattern heuristic.
     """
-    if audit.profile['name'] != 'agy-1.2.7-go1.28-20260721-RC03-pinned':
+    if audit.profile is None:
+        raise ValueError('Go legacy init redirection requires a verified runtime layout')
+    if audit.profile['name'] != AGY_PROFILE:
         return None
     entry, callback, call, target = 0x67fe016, 0x9d3c8c0, 0x9d3c8d7, 0x9d3fbac
     if original_init != target:
@@ -509,14 +748,14 @@ def legacy_init_patch(audit, original_init, installer_va):
     if audit.read(call, 5) != original:
         raise Unsupported('pinned agy legacy init call changed')
     patch = checked_init_call_patch(audit, call, target, installer_va)
-    patch['evidence'] = dict(kind='pinned-legacy-init-call', address=call,
-                             callback=callback, original_target=target,
-                             initializer=installer_va,
-                             original_bytes=original.hex(), replacement_bytes=patch['new'].hex())
-    return patch
+    return {**patch, 'evidence': dict(kind='pinned-legacy-init-call', address=call,
+                                      callback=callback, original_target=target,
+                                      initializer=installer_va,
+                                      original_bytes=original.hex(), replacement_bytes=patch['new'].hex())}
 
 
-def typelinks_fast_path_patch(audit, blob, metadata_va, fixups):
+def typelinks_fast_path_patch(audit: Audit, blob: bytes | bytearray, metadata_va: int,
+                              fixups: list[tuple[int, int]]) -> TypelinksPatch | None:
     """Preserve agy's single-type-module fast path without hiding later modules.
 
     The generated module has no types. Standard module registration appends
@@ -524,7 +763,9 @@ def typelinks_fast_path_patch(audit, blob, metadata_va, fixups):
     and selects the untouched original type-deduplication path.
     """
     profile = audit.profile
-    if profile['name'] != 'agy-1.2.7-go1.28-20260721-RC03-pinned':
+    if profile is None:
+        raise ValueError('Go typelinks fast path requires a verified runtime layout')
+    if profile['name'] != AGY_PROFILE:
         return None
     if (profile['module'], profile['lastmoduledatap'], profile['next'], profile['size']) != (0xbcc95e0, 0xbcca438, 0x230, 568):
         raise Unsupported('pinned agy module topology/layout changed')
@@ -564,7 +805,8 @@ def typelinks_fast_path_patch(audit, blob, metadata_va, fixups):
                               future_module_append='non-null synthetic.next selects unchanged slow path'))
 
 
-def build(audit, ranges, metadata_va, installer_va, work=None):
+def build(audit: Audit, ranges: list[StubRange], metadata_va: int, installer_va: int,
+          work: str | Path | None = None) -> BuildResult:
     """Build one text-only module and a pre-runtime PIE-safe initializer.
 
     Ranges are contiguous dictionaries with start/end/original_pc/continuation
@@ -579,7 +821,9 @@ def build(audit, ranges, metadata_va, installer_va, work=None):
         raise Unsupported(audit.profile_error or 'Go runtime layout is unverified')
     if not ranges:
         raise Unsupported('no Go stub ranges to register')
-    ranges = sorted(ranges, key=lambda r: r['start'])
+    def range_start(r: StubRange) -> int:
+        return r['start']
+    ranges = sorted(ranges, key=range_start)
     if any(left['end'] != right['start'] for left, right in zip(ranges, ranges[1:])):
         raise Unsupported('Go module must cover only contiguous Go stub code')
     if metadata_va % 8:
@@ -589,20 +833,13 @@ def build(audit, ranges, metadata_va, installer_va, work=None):
         raise Unsupported('Go text module exceeds the uint32 function-offset format')
     profile = audit.profile
     names, files, cutab, pctab = bytearray(b'\0'), bytearray(), bytearray(), bytearray(b'\0')
-    prepared, coverage = [], []
+    prepared: list[bytes] = []
+    coverage: list[RangeCoverage] = []
     for item in ranges:
         pc = item['original_pc']
+        # replacement_site checks the function, the stack delta and the instruction.
         f, site = audit.function(pc), audit.replacement_site(pc)
-        if f['func_id'] != 0 or f['func_flag'] & ~4 or f['deferreturn']:
-            raise Unsupported('Go source uses special runtime, SP-write or defer-return semantics')
-        if len(f['funcdata']) > 4 and f['funcdata'][4] != 0xffffffff:
-            raise Unsupported('Go source has open-coded defer metadata')
-        if site['pcsp'] < 0 or site['pcsp'] % 8 or site['pcsp'] > 0x7fffffff:
-            raise Unsupported('Go source has an invalid stack delta')
-        original = next(iter(Decoder(64, audit.read(pc, min(15, f['end'] - pc)), ip=pc)))
-        if original.mnemonic != Mnemonic.POPCNT or original.memory_base or original.memory_index:
-            raise Unsupported('initial Go backend supports register-only POPCNT')
-        if item['continuation'] != original.next_ip:
+        if item['continuation'] != site.get('continuation'):
             raise Unsupported('Go stub may replace only one complete original instruction')
         validate_code(item['code'], item['start'], item['end'], item['continuation'])
         length = item['end'] - item['start']
@@ -610,7 +847,7 @@ def build(audit, ranges, metadata_va, installer_va, work=None):
         names += f['name'].encode() + b'\0'
         table = f['table']
         header = audit.read(table['address'], 72)
-        offsets = struct.unpack_from('<5Q', header, 32)
+        offsets = unpack_ints('<5Q', header, 32)
         fileoff = len(files)
         fileno = site['pcfile']
         if fileno < 0:
@@ -619,7 +856,7 @@ def build(audit, ranges, metadata_va, installer_va, work=None):
             slot = f['cu_offset'] + fileno
             if slot * 4 + 4 > offsets[2] - offsets[1]:
                 raise Unsupported('original Go CU file index is out of bounds')
-            original_offset = struct.unpack('<I', audit.read(table['address'] + offsets[1] + slot * 4, 4))[0]
+            original_offset = unpack_ints('<I', audit.read(table['address'] + offsets[1] + slot * 4, 4))[0]
             if original_offset >= offsets[3] - offsets[2]:
                 raise Unsupported('original Go filename offset is out of bounds')
             raw = audit.read(table['address'] + offsets[2] + original_offset, offsets[3] - offsets[2] - original_offset)
@@ -629,18 +866,18 @@ def build(audit, ranges, metadata_va, installer_va, work=None):
             filename = raw[:terminator]
         files += filename + b'\0'
         cutab += struct.pack('<I', fileoff)
-        def encoded(value):
+        def encoded(value: int) -> int:
             offset = len(pctab)
             pctab.extend(constpc(value, length))
             return offset
-        pcsp, pcfile, pcln = encoded(site['pcsp']), encoded(len(prepared)), encoded(site['pcln'])
+        pcsp_offset, pcfile_offset, pcln_offset = encoded(site['pcsp']), encoded(len(prepared)), encoded(site['pcln'])
         original_pcd = list(site['pcdata'])
         original_pcd += [-1] * max(0, 3 - len(original_pcd))
         original_pcd[0] = -2  # UnsafePointUnsafe: no GC/preemption with hidden scratch pointers.
         original_pcd[2] = -1  # No synthetic inline tree: source file/line/name are explicit.
         pcd = [encoded(value) for value in original_pcd]
-        rawfunc = struct.pack('<Ii i IIIIII i BBBB'.replace(' ', ''), item['start'] - text, nameoff,
-                              f['args'], 0, pcsp, pcfile, pcln, len(pcd), 0,
+        rawfunc = struct.pack(_FUNC, item['start'] - text, nameoff,
+                              f['args'], 0, pcsp_offset, pcfile_offset, pcln_offset, len(pcd), 0,
                               f['start_line'], 0, 4, 0, len(f['funcdata']))
         rawfunc += struct.pack(f'<{len(pcd) + len(f["funcdata"])}I', *pcd, *f['funcdata'])
         prepared.append(rawfunc)
@@ -664,8 +901,8 @@ def build(audit, ranges, metadata_va, installer_va, work=None):
             raise Unsupported('Go findfunc subbucket exceeds its 8-bit index delta')
         findtab += struct.pack('<I16B', first, *deltas)
     blob = bytearray(profile['size'])
-    fixups = []
-    def append(raw, alignment=8):
+    fixups: list[tuple[int, int]] = []
+    def append(raw: bytes | bytearray, alignment: int = 8) -> int:
         blob.extend(b'\0' * (-len(blob) % alignment))
         position = len(blob)
         blob.extend(raw)
@@ -675,7 +912,7 @@ def build(audit, ranges, metadata_va, installer_va, work=None):
     empty_gc_at = append(b'\0')
     struct.pack_into('<I4B8Q', blob, header_at, 0xfffffff1, 0, 0, 1, 8, len(ranges), len(ranges),
                      0, names_at-header_at, cutab_at-header_at, files_at-header_at, pctab_at-header_at, pcln_at-header_at)
-    def pointer(slot, address):
+    def pointer(slot: int, address: int) -> None:
         fixups.append((metadata_va + slot, address))
     pointer(0, metadata_va + header_at)
     for slot, at, count in ((8, names_at, len(names)), (32, cutab_at, len(ranges)),
@@ -694,6 +931,8 @@ def build(audit, ranges, metadata_va, installer_va, work=None):
     preinit = preinit_registration(audit, installer_va)
     target, patch_offset, method = audit.elf['e_entry'], 24, 'ELF entry before Go runtime startup'
     if dynamic:
+        if not isinstance(dynamic, DynamicSection):
+            raise ValueError('.dynamic is not an ELF dynamic section')
         for index, tag in enumerate(dynamic.iter_tags()):
             if tag.entry.d_tag == 'DT_INIT':
                 target = tag.entry.d_val
@@ -739,8 +978,8 @@ def build(audit, ranges, metadata_va, installer_va, work=None):
               '.cfi_endproc', '.global go_init_end', 'go_init_end:', '.size go_init, .-go_init',
               '.section .note.GNU-stack,"",@progbits']
     constructor, constructor_elf_data = _assemble('\n'.join(lines) + '\n', installer_va, work, with_elf=True)
-    patch = dict(offset=patch_offset, old=audit.data[patch_offset:patch_offset + 8], new=struct.pack('<Q', installer_va))
-    patches = preinit['patches'] if preinit is not None else [patch] + ([legacy_patch] if legacy_patch is not None else [])
+    patch: LoaderPatch = dict(offset=patch_offset, old=audit.data[patch_offset:patch_offset + 8], new=struct.pack('<Q', installer_va))
+    patches: list[LoaderPatch] = preinit['patches'] if preinit is not None else [patch] + ([legacy_patch] if legacy_patch is not None else [])
     type_fast_path = typelinks_fast_path_patch(audit, blob, metadata_va, fixups)
     if type_fast_path is not None:
         patches.append(type_fast_path)

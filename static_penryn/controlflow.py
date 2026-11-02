@@ -9,12 +9,37 @@ Function boundaries come from ELF symbols and pyelftools' DWARF FDE parser.
 from array import array
 from bisect import bisect_right
 from collections import Counter, deque
+from collections.abc import Iterable
 from heapq import merge
-import struct
+from typing import TypedDict
 
 import iced_x86 as ix
 from elftools.dwarf.callframe import FDE
+from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import SymbolTableSection
+
+from .checked import iter_ints
+
+
+class RelativeTable(TypedDict):
+    """One recovered rel32 jump table; `targets` are sorted and unique."""
+    table: int
+    entries: int
+    entry_size: int
+    dispatch: int
+    guard: int
+    default: int
+    targets: list[int]
+
+
+class CFGReport(TypedDict):
+    function_ranges: int
+    function_sources: dict[str, int]
+    relative_table_candidates: int
+    relative_tables: list[RelativeTable]
+    instruction_boundary_bytes: int
+    block_leaders: int
+    indirect_recovery_complete: bool
 
 
 class Recovery:
@@ -27,29 +52,33 @@ class Recovery:
     Extra function_ranges are (start, end, name) records from another parser.
     """
 
-    def __init__(self, elf, *, function_ranges=(), max_table_entries=4096):
+    def __init__(self, elf: ELFFile, *, function_ranges: Iterable[tuple[int, int, str]] = (),
+                 max_table_entries: int = 4096) -> None:
         self.elf = elf
-        self.targets = set()
-        self.functions = []
-        self.tables = []
+        self.targets: set[int] = set()
+        # (start, end, name, source)
+        self.functions: list[tuple[int, int, str, str]] = []
+        self.tables: list[RelativeTable] = []
         self.max_table_entries = max_table_entries
-        self.window = deque(maxlen=12)
+        self.window: deque[ix.Instruction] = deque(maxlen=12)
         self._factory = ix.InstructionInfoFactory()
         self._finished = False
-        self._current = None
-        self._last = None
-        self._section = []
-        self._readable = []
-        self._starts = []
-        self._function_starts = []
-        self._function_ends = []
+        self._current: tuple[int, int, int, bytearray] | None = None
+        self._last: int | None = None
+        # (start, end, file offset, instruction-start bitmap)
+        self._section: list[tuple[int, int, int, bytearray]] = []
+        # (start, end, file offset)
+        self._readable: list[tuple[int, int, int]] = []
+        self._starts: list[int] = []
+        self._function_starts: list[int] = []
+        self._function_ends: list[int] = []
         self._functions_dirty = True
-        self._table_keys = set()
+        self._table_keys: set[tuple[int, int, int]] = set()
         self._candidate_count = 0
-        self._leaders = set()
+        self._leaders: set[int] = set()
         self._ordered_leaders = array('Q')
         self._leaders_dirty = True
-        self._pending_leader = None
+        self._pending_leader: int | None = None
         loads = [seg for seg in elf.iter_segments() if seg['p_type'] == 'PT_LOAD']
         for sec in elf.iter_sections():
             start, count = sec['sh_addr'], sec['sh_size']
@@ -65,7 +94,10 @@ class Recovery:
                 self._section.append((start, start + count, sec['sh_offset'],
                                       bytearray((count + 7) // 8)))
                 self._leaders.update((start, start + count))
-        self._section.sort(key=lambda item: item[0])
+        def section_start(item: tuple[int, int, int, bytearray]) -> int:
+            return item[0]
+
+        self._section.sort(key=section_start)
         self._starts = [item[0] for item in self._section]
         self._readable.sort()
         self._read_starts = [item[0] for item in self._readable]
@@ -93,17 +125,17 @@ class Recovery:
                 raise ValueError(f'cannot recover .eh_frame function ranges: {exc}') from exc
         self.add_functions(function_ranges, source='external')
 
-    def is_code(self, address):
+    def is_code(self, address: int) -> bool:
         index = bisect_right(self._starts, address) - 1
         return index >= 0 and address < self._section[index][1]
 
     @property
-    def table_ranges(self):
+    def table_ranges(self) -> list[tuple[int, int]]:
         """Data spans to protect from rewriting, including tables in RX text."""
         return [(item['table'], item['table'] + item['entries'] * item['entry_size'])
                 for item in self.tables]
 
-    def add_functions(self, ranges, *, source='external'):
+    def add_functions(self, ranges: Iterable[tuple[int, int, str]], *, source: str = 'external') -> None:
         """Add parser-derived ranges; malformed/foreign ranges are ignored."""
         for start, end, name in ranges:
             index = bisect_right(self._starts, start) - 1
@@ -115,7 +147,7 @@ class Recovery:
                 self._leaders_dirty = True
                 self._functions_dirty = True
 
-    def _index_functions(self):
+    def _index_functions(self) -> None:
         if not self._functions_dirty:
             return
         self.functions = sorted(set(self.functions))
@@ -127,7 +159,7 @@ class Recovery:
             self._function_ends.append(maximum)
         self._functions_dirty = False
 
-    def bounds(self, address):
+    def bounds(self, address: int) -> tuple[int, int] | None:
         """Intersect all covering symbol/FDE intervals; gaps remain unknown."""
         self._index_functions()
         index = bisect_right(self._function_starts, address) - 1
@@ -141,7 +173,7 @@ class Recovery:
             index -= 1
         return (begin, end) if found else None
 
-    def _index_leaders(self):
+    def _index_leaders(self) -> None:
         if self._leaders_dirty:
             self._leaders.update(self.targets)
             if not self._ordered_leaders:
@@ -150,7 +182,7 @@ class Recovery:
                 # add_functions remains usable after finish without rebuilding
                 # a multi-million-entry Python set from the frozen index.
                 ordered = array('Q')
-                previous = None
+                previous: int | None = None
                 for address in merge(self._ordered_leaders, sorted(self._leaders)):
                     if address != previous:
                         ordered.append(address)
@@ -159,7 +191,7 @@ class Recovery:
             self._leaders.clear()
             self._leaders_dirty = False
 
-    def block_bounds(self, address):
+    def block_bounds(self, address: int) -> tuple[int, int] | None:
         """Return a verified, branch-delimited interval even without symbols.
 
         Leaders include section/function boundaries, recovered table targets,
@@ -180,7 +212,7 @@ class Recovery:
             return None
         return start, end
 
-    def lookup(self, address):
+    def lookup(self, address: int) -> ix.Instruction | None:
         if not self._finished:
             raise ValueError('finish the linear scan before successor lookup')
         index = bisect_right(self._starts, address) - 1
@@ -196,7 +228,7 @@ class Recovery:
         ins = ix.Decoder(64, self.elf.stream.read(min(15, end - address)), ip=address).decode()
         return None if ins.is_invalid else ins
 
-    def _read_table(self, address, count):
+    def _read_table(self, address: int, count: int) -> bytes | None:
         index = bisect_right(self._read_starts, address) - 1
         if index < 0:
             return None
@@ -207,7 +239,7 @@ class Recovery:
         data = self.elf.stream.read(count)
         return data if len(data) == count else None
 
-    def feed(self, ins):
+    def feed(self, ins: ix.Instruction) -> None:
         if self._finished:
             raise ValueError('cannot feed after finish')
         if self._current is None or not self._current[0] <= ins.ip < self._current[1]:
@@ -237,7 +269,7 @@ class Recovery:
                 and ins.op0_kind == ix.OpKind.REGISTER):
             self._recover_relative_table()
 
-    def _writes(self, ins, register):
+    def _writes(self, ins: ix.Instruction, register: ix.Register_) -> bool:
         for use in self._factory.info(ins).used_registers():
             if (ix.RegisterExt.full_register(use.register) == register
                     and use.access in (ix.OpAccess.WRITE, ix.OpAccess.COND_WRITE,
@@ -245,7 +277,7 @@ class Recovery:
                 return True
         return False
 
-    def _recover_relative_table(self):
+    def _recover_relative_table(self) -> None:
         window = list(self.window)
         if len(window) < 6:
             return
@@ -266,7 +298,7 @@ class Recovery:
         self._candidate_count += 1
         base, index = load.memory_base, load.memory_index
         prefix = window[:-3]
-        lea_index = None
+        lea_index: int | None = None
         for j in range(len(prefix) - 1, -1, -1):
             ins = prefix[j]
             if self._writes(ins, base):
@@ -277,7 +309,7 @@ class Recovery:
         if lea_index is None:
             return
         table = prefix[lea_index].ip_rel_memory_address
-        guard = None
+        guard: tuple[ix.Instruction, ix.Instruction, int] | None = None
         for j in range(len(prefix) - 2, -1, -1):
             cmp_ins, branch = prefix[j:j + 2]
             if not (cmp_ins.mnemonic == ix.Mnemonic.CMP
@@ -305,7 +337,7 @@ class Recovery:
         raw = self._read_table(table, count * 4)
         if raw is None:
             return
-        targets = [table + value for (value,) in struct.iter_unpack('<i', raw)]
+        targets = [table + value for (value,) in iter_ints('<i', raw)]
         if not all(self.is_code(target) for target in targets):
             return
         key = (table, count, jump.ip)
@@ -319,7 +351,7 @@ class Recovery:
                             'default': branch.near_branch_target,
                             'targets': sorted(set(targets))})
 
-    def finish(self):
+    def finish(self) -> CFGReport:
         if self._pending_leader is not None:
             self._leaders.add(self._pending_leader)
             self._leaders_dirty = True

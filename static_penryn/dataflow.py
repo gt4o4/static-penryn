@@ -7,8 +7,11 @@ accesses; bounded verified successors can be followed without assumptions
 about calling conventions, distant blocks or signal handlers.
 This is an optimization of normal execution, not async context equivalence.
 """
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 import iced_x86 as ix
+
+from .checked import constants
 
 GPRS = frozenset(range(ix.Register.RAX, ix.Register.R15 + 1)) - {ix.Register.RSP}
 XMMS = frozenset(range(ix.Register.XMM0, ix.Register.XMM15 + 1))
@@ -16,25 +19,26 @@ STATUS = (ix.RflagsBits.CF | ix.RflagsBits.PF | ix.RflagsBits.AF |
           ix.RflagsBits.ZF | ix.RflagsBits.SF | ix.RflagsBits.OF)
 READS = {ix.OpAccess.READ, ix.OpAccess.COND_READ, ix.OpAccess.READ_WRITE,
          ix.OpAccess.READ_COND_WRITE}
+_MNEMONICS = constants(ix.Mnemonic)
 # Variable-count shifts/rotates are deliberately absent: zero can leave the
 # flags untouched even though instruction metadata lists flags as modified.
-FLAG_KILLERS = {getattr(ix.Mnemonic, name) for name in (
+FLAG_KILLERS = {_MNEMONICS[name] for name in (
     'ADD', 'ADC', 'SUB', 'SBB', 'CMP', 'NEG', 'AND', 'OR', 'XOR', 'TEST',
     'INC', 'DEC', 'CLC', 'STC', 'POPCNT', 'PCMPISTRI', 'PCMPISTRM',
     'PCMPESTRI', 'PCMPESTRM', 'PCMPESTRI64', 'PCMPESTRM64')}
-SAFE = {getattr(ix.Mnemonic, name) for name in (
+SAFE = {_MNEMONICS[name] for name in (
     'MOV', 'MOVZX', 'MOVSX', 'MOVSXD', 'LEA', 'ADD', 'ADC', 'SUB', 'SBB',
     'CMP', 'NEG', 'NOT', 'AND', 'OR', 'XOR', 'TEST', 'INC', 'DEC', 'CLC',
     'STC', 'CMC', 'SHL', 'SHR', 'SAR', 'SAL', 'ROL', 'ROR', 'RCL', 'RCR',
     'BSWAP', 'XCHG', 'NOP', 'POPCNT', 'CRC32', 'PCMPGTQ', 'LAHF', 'SAHF')
-    if hasattr(ix.Mnemonic, name)}
-SAFE |= {value for name, value in vars(ix.Mnemonic).items()
+    if name in _MNEMONICS}
+SAFE |= {value for name, value in _MNEMONICS.items()
          if name.startswith('CMOV') or name.startswith('SET')}
 # Register-only integer/bitwise SSE operations do not raise floating-point
 # exceptions. Memory operands still stop the proof. Scalar MOVSS/MOVSD and
 # partial insertions are safe to inspect: iced describes the old-destination
 # read, so they cannot incorrectly kill an entire XMM value.
-SAFE |= {getattr(ix.Mnemonic, name) for name in (
+SAFE |= {_MNEMONICS[name] for name in (
     'MOVAPS', 'MOVAPD', 'MOVUPS', 'MOVUPD', 'MOVDQA', 'MOVDQU', 'MOVD', 'MOVQ',
     'MOVSS', 'MOVSD', 'PXOR', 'PAND', 'PANDN', 'POR', 'XORPS', 'XORPD', 'ANDPS',
     'ANDPD', 'ANDNPS', 'ANDNPD', 'ORPS', 'ORPD', 'PSHUFD', 'PSHUFLW', 'PSHUFHW',
@@ -53,12 +57,14 @@ SAFE |= {getattr(ix.Mnemonic, name) for name in (
 @dataclass(frozen=True)
 class Hints:
     preserve_flags: bool = True
-    dead_registers: frozenset = frozenset()
-    dead_xmms: frozenset = frozenset()
+    dead_registers: frozenset[int] = frozenset()
+    dead_xmms: frozenset[int] = frozenset()
 
 
-def analyze(instructions, limit=24, *, lookup=None, bounds=None,
-            max_nodes=64, max_branches=4):
+def analyze(instructions: Iterable[ix.Instruction], limit: int = 24, *,
+            lookup: Callable[[int], ix.Instruction | None] | None = None,
+            bounds: tuple[int, int] | None = None,
+            max_nodes: int = 64, max_branches: int = 4) -> Hints:
     """Facts after a replacement; an unproven value always remains live.
 
     Without lookup/bounds, retain the original fall-through-only behavior.
@@ -69,9 +75,9 @@ def analyze(instructions, limit=24, *, lookup=None, bounds=None,
     finite budgets stop each affected path conservatively. No ABI assumptions
     or execution-profile coverage are used as liveness evidence.
     """
-    local = {}
-    first = None
-    previous = None
+    local: dict[int, ix.Instruction] = {}
+    first: int | None = None
+    previous: int | None = None
     for index, ins in enumerate(instructions):
         if index >= limit or (previous is not None and ins.ip != previous):
             break
@@ -85,31 +91,35 @@ def analyze(instructions, limit=24, *, lookup=None, bounds=None,
     factory = ix.InstructionInfoFactory()
     budget = [max_nodes, max_branches]
 
-    def result(dead, dead_xmm, flags_pending, flags_read):
+    def result(dead: set[int], dead_xmm: set[int], flags_pending: int,
+               flags_read: bool) -> Hints:
         return Hints(flags_read or bool(flags_pending), frozenset(dead),
                      frozenset(dead_xmm))
 
-    def merge(left, right):
+    def merge(left: Hints, right: Hints) -> Hints:
         return Hints(left.preserve_flags or right.preserve_flags,
                      left.dead_registers & right.dead_registers,
                      left.dead_xmms & right.dead_xmms)
 
-    def visit(address, pending, dead, pending_xmm, dead_xmm,
-              flags_pending, flags_read, path, allow_local=True):
+    # cfg implies that lookup and bounds are both present; the explicit None
+    # tests below only restate that for the type checker.
+    def visit(address: int, pending: set[int], dead: set[int], pending_xmm: set[int],
+              dead_xmm: set[int], flags_pending: int, flags_read: bool, path: set[int],
+              allow_local: bool = True) -> Hints:
         while True:
             current = result(dead, dead_xmm, flags_pending, flags_read)
             if (address in path or budget[0] <= 0
-                    or (cfg and not bounds[0] <= address < bounds[1])):
+                    or (cfg and bounds is not None and not bounds[0] <= address < bounds[1])):
                 return current
             # Direct destinations must go through lookup, including a branch
             # into the middle of the locally decoded fall-through window.
             ins = local.get(address) if allow_local else None
-            if ins is None and cfg:
+            if ins is None and cfg and lookup is not None:
                 ins = lookup(address)
             if (ins is None or ins.ip != address or ins.is_invalid
                     or ins.is_privileged or ins.has_lock_prefix
                     or ins.encoding != ix.EncodingKind.LEGACY
-                    or (cfg and ins.next_ip > bounds[1])):
+                    or (cfg and bounds is not None and ins.next_ip > bounds[1])):
                 return current
             direct = ins.flow_control in (
                 ix.FlowControl.CONDITIONAL_BRANCH, ix.FlowControl.UNCONDITIONAL_BRANCH)

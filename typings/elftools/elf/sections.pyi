@@ -1,0 +1,43 @@
+from collections.abc import Iterator, Mapping
+from typing import Literal, overload
+
+_SectionInt = Literal[
+    'sh_name', 'sh_flags', 'sh_addr', 'sh_offset', 'sh_size', 'sh_link',
+    'sh_info', 'sh_addralign', 'sh_entsize',
+]
+
+class Section:
+    name: str
+    header: Mapping[str, int | str]
+    @overload
+    def __getitem__(self, name: _SectionInt) -> int: ...
+    @overload
+    def __getitem__(self, name: Literal['sh_type']) -> str | int: ...
+    def data(self) -> bytes: ...
+
+class SymbolInfo:
+    def __getitem__(self, name: Literal['type', 'bind']) -> str | int: ...
+
+class Symbol:
+    name: str
+    @overload
+    def __getitem__(self, name: Literal['st_name', 'st_value', 'st_size']) -> int: ...
+    @overload
+    def __getitem__(self, name: Literal['st_shndx']) -> int | str: ...
+    @overload
+    def __getitem__(self, name: Literal['st_info']) -> SymbolInfo: ...
+
+class SymbolTableSection(Section):
+    def get_symbol(self, n: int) -> Symbol: ...
+    def iter_symbols(self) -> Iterator[Symbol]: ...
+
+class Note:
+    @overload
+    def __getitem__(self, name: Literal['n_type']) -> str | int: ...
+    @overload
+    def __getitem__(self, name: Literal['n_desc']) -> bytes | str: ...
+    @overload
+    def __getitem__(self, name: Literal['n_name']) -> str: ...
+
+class NoteSection(Section):
+    def iter_notes(self) -> Iterator[Note]: ...

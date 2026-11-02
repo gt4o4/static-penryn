@@ -10,24 +10,59 @@ the fixture, independently of ripgrep. No authenticated agent prompt is run.
 Profiles rank measured sites; never treat an unobserved site as unreachable.
 """
 import argparse
+from collections.abc import Sequence
 import hashlib
 import json
 from pathlib import Path
 import resource
+from typing import TypedDict
 
 from . import profile as profiler
+from .checked import as_int, as_str
 
 
-def fixture(directory, *, files=64, lines=512):
+class Fixture(TypedDict):
+    files: int
+    lines_per_file: int
+    total_lines: int
+    bytes: int
+    files_sha256: dict[str, str]
+    matching_lines: int
+
+
+class Combined(TypedDict):
+    mode: str
+    input_sha256: object
+    output_sha256: str
+    binary_sha256: str
+    workloads: int
+    aggregation: str
+    site_counts: list[profiler.SiteCount]
+
+
+class WorkloadResult(TypedDict):
+    profile: str
+    status: str
+    output_verified: bool
+    active_sites: int
+
+
+class Results(TypedDict):
+    fixture: Fixture
+    results: dict[str, WorkloadResult]
+
+
+def fixture(directory: str | Path, *, files: int = 64, lines: int = 512) -> tuple[Fixture, dict[str, bytes]]:
     directory = Path(directory).resolve()
     directory.mkdir(parents=True)
-    expected, hashes = {}, {}
-    matches = []
+    expected: dict[str, bytes] = {}
+    hashes: dict[str, str] = {}
+    matches: list[tuple[str, int, str]] = []
     for f in range(files):
         relative = f'd{f % 8:02d}/f{f:03d}.txt'
         path = directory / relative
         path.parent.mkdir(exist_ok=True)
-        content = []
+        content: list[str] = []
         for n in range(lines):
             index = f * lines + n
             token = 'Penryn' if index % 97 == 0 else 'scalar'
@@ -38,29 +73,51 @@ def fixture(directory, *, files=64, lines=512):
         data = ''.join(content).encode()
         path.write_bytes(data)
         hashes[relative] = hashlib.sha256(data).hexdigest()
-    matches.sort(key=lambda m: (m[0], m[1]))
+
+    def by_path_line(match: tuple[str, int, str]) -> tuple[str, int]:
+        return match[0], match[1]
+
+    matches.sort(key=by_path_line)
     expected['rg-search'] = ''.join(f'{directory / f}:{n}:{line}\n' for f, n, line in matches).encode()
     expected['rg-utf8'] = ''.join(f'{directory / f}:{lines}\n' for f in sorted(hashes)).encode()
     expected['rg-files'] = ''.join(f'{directory / f}\n' for f in sorted(hashes)).encode()
-    return dict(files=files, lines_per_file=lines, total_lines=files * lines,
-                bytes=sum((directory / f).stat().st_size for f in hashes),
-                files_sha256=hashes, matching_lines=len(matches)), expected
+    return Fixture(files=files, lines_per_file=lines, total_lines=files * lines,
+                   bytes=sum((directory / f).stat().st_size for f in hashes),
+                   files_sha256=hashes, matching_lines=len(matches)), expected
 
 
-def merge_counts(profiles, model):
-    merged = {}
+def merge_counts(profiles: Sequence[profiler.CountOutput], model: profiler.Model) -> Combined:
+    merged: dict[str, int] = {}
     for report in profiles:
         if report['input_sha256'] != model['input_sha256'] or report['output_sha256'] != model['sha256']:
             raise ValueError('cannot merge profiles of different executable revisions')
         for row in report['site_counts']:
             merged[row['address']] = merged.get(row['address'], 0) + row['executions']
-    return dict(mode='qemu-instruction-attempts', input_sha256=model['input_sha256'],
-                output_sha256=model['sha256'], binary_sha256=model['sha256'],
-                workloads=len(profiles), aggregation='unweighted sum of the recorded workloads',
-                site_counts=[dict(address=k, executions=v) for k, v in sorted(merged.items(), key=lambda p: -p[1])])
+
+    def by_executions(item: tuple[str, int]) -> int:
+        return -item[1]
+
+    return Combined(mode='qemu-instruction-attempts', input_sha256=model['input_sha256'],
+                    output_sha256=model['sha256'], binary_sha256=model['sha256'],
+                    workloads=len(profiles), aggregation='unweighted sum of the recorded workloads',
+                    site_counts=[profiler.SiteCount(address=k, executions=v)
+                                 for k, v in sorted(merged.items(), key=by_executions)])
 
 
-def main():
+class Options(argparse.Namespace):
+    agy: Path | None
+    agy_report: Path | None
+    claude: Path | None
+    claude_report: Path | None
+    work: Path
+    mode: str
+    qemu: str
+    perf: str
+    files: int
+    lines: int
+
+
+def main() -> None:
     resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--agy', type=Path)
@@ -73,8 +130,7 @@ def main():
     parser.add_argument('--perf', default='perf')
     parser.add_argument('--files', type=int, default=64)
     parser.add_argument('--lines', type=int, default=512)
-    parser.add_argument('--legacy-ranges', action='store_true')
-    args = parser.parse_args()
+    args = parser.parse_args(namespace=Options())
     if not args.agy and not args.claude:
         parser.error('supply at least one application')
     if args.work.exists():
@@ -86,21 +142,22 @@ def main():
     corpus = work / 'corpus'
     description, expected = fixture(corpus, files=args.files, lines=args.lines)
     (work / 'fixture.json').write_text(json.dumps(description, indent=2) + '\n')
-    results = {}
+    results: dict[str, WorkloadResult] = {}
     for app in ('agy', 'claude'):
-        binary = getattr(args, app)
+        binary = args.agy if app == 'agy' else args.claude
         if not binary:
             continue
-        report_path = getattr(args, app + '_report') or Path(str(binary) + '.json')
-        model = profiler.load_model(binary, report_path, legacy=args.legacy_ranges)
+        report_path = (args.agy_report if app == 'agy' else args.claude_report) or Path(str(binary) + '.json')
+        model = profiler.load_model(binary, report_path)
         jobs = [('version', ['--version'], app), ('help', ['--help'], app)]
         if app == 'claude':
             jobs += [('rg-search', ['-n', '--sort', 'path', r'Penryn.*中文.*alpha', str(corpus)], 'rg'),
                      ('rg-utf8', ['-c', '--sort', 'path', r'\p{Greek}+.*中文.*🙂', str(corpus)], 'rg'),
                      ('rg-files', ['--files', '--sort', 'path', str(corpus)], 'rg')]
-        profiles = []
+        profiles: list[profiler.CountOutput] = []
         for name, command, argv0 in jobs:
             target = work / f'{app}-{name}'
+            result: profiler.CountOutput | profiler.NativeOutput
             if args.mode == 'count':
                 result = profiler.count(model, command, target, argv0=argv0, qemu=args.qemu)
                 profiles.append(result)
@@ -113,15 +170,17 @@ def main():
                         raise RuntimeError(f'{app} {name} output differs from independently generated expected output')
                 elif not stdout.strip() and not (target / 'stderr').read_bytes().strip():
                     raise RuntimeError(f'{app} {name} produced no output')
-            results[f'{app}-{name}'] = dict(profile=str(target / 'profile.json'),
-                                            status=result.get('status', 'complete'),
-                                            output_verified=result.get('status') != 'unavailable',
-                                            active_sites=sum(r.get('entries', r.get('samples', 0)) > 0
-                                                             for r in result.get('rows', []) if r['kind'] == 'site'))
+            # Over the count/native union these .get()s type as object; the values are str and int.
+            results[f'{app}-{name}'] = WorkloadResult(
+                profile=str(target / 'profile.json'),
+                status=as_str(result.get('status', 'complete'), 'profile status'),
+                output_verified=result.get('status') != 'unavailable',
+                active_sites=sum(as_int(r.get('entries', r.get('samples', 0)), 'profile row count') > 0
+                                 for r in result.get('rows', []) if r['kind'] == 'site'))
             print(f'{app}-{name}: {results[f"{app}-{name}"]}', flush=True)
         if profiles:
             (work / f'{app}-combined.json').write_text(json.dumps(merge_counts(profiles, model), indent=2) + '\n')
-    (work / 'results.json').write_text(json.dumps(dict(fixture=description, results=results), indent=2) + '\n')
+    (work / 'results.json').write_text(json.dumps(Results(fixture=description, results=results), indent=2) + '\n')
 
 
 if __name__ == '__main__':

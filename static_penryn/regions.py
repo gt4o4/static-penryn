@@ -7,15 +7,23 @@ glue defaults to nonfaulting register operations with no stack/frame use.
 Read-only load glue requires a separate opt-in for relocated fault contexts.
 """
 import bisect
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
-import json
+from pathlib import Path
 import re
+from typing import TYPE_CHECKING, Protocol, TypedDict
 
 import iced_x86 as ix
 from . import lower
+from .checked import as_object, constants, is_list, load_json, member
+
+if TYPE_CHECKING:
+    from .dataflow import Hints
+    from .patch import Site
 
 
-GLUE = {getattr(ix.Mnemonic, name) for name in (
+_MNEMONICS = constants(ix.Mnemonic)
+GLUE = {_MNEMONICS[name] for name in (
     'MOV', 'MOVZX', 'MOVSX', 'MOVSXD', 'LEA', 'ADD', 'SUB', 'AND', 'OR',
     'XOR', 'TEST', 'CMP', 'INC', 'DEC', 'NEG', 'NOT', 'BSWAP', 'NOP',
     'SHL', 'SHR', 'SAR', 'ROL', 'ROR', 'PXOR', 'PAND', 'POR', 'MOVDQA',
@@ -24,18 +32,35 @@ GLUE = {getattr(ix.Mnemonic, name) for name in (
 INFO = ix.InstructionInfoFactory()
 
 
-def read_profile(path, input_sha256):
+class BlockRecovery(Protocol):
+    """What grouping reads of controlflow.Recovery; tests substitute fakes."""
+    def bounds(self, address: int) -> tuple[int, int] | None: ...
+    def block_bounds(self, address: int) -> tuple[int, int] | None: ...
+    def lookup(self, address: int) -> ix.Instruction | None: ...
+
+
+class SharedFrame(TypedDict):
+    """shared_lowering's report of the region's shared save frame."""
+    gprs: list[str]
+    xmms: list[str]
+    frame_bytes: int
+    maximum_stack_bytes: int
+
+
+def read_profile(path: Path, input_sha256: str) -> dict[int, int]:
     """Only exact-input execution profiles influence grouping and layout."""
-    report = json.loads(path.read_text())
+    report = as_object(load_json(path.read_text()), 'profile')
     if report.get('input_sha256') != input_sha256:
         raise ValueError('profile belongs to a different original executable')
     rows = report.get('site_counts')
-    if not isinstance(rows, list):
+    if not is_list(rows):
         raise ValueError('profile requires a site_counts execution-count array')
-    result = {}
+    result: dict[int, int] = {}
     for row in rows:
-        address = int(row['address'], 0) if isinstance(row['address'], str) else row['address']
-        count = row['executions']
+        row = as_object(row, 'profile site count')
+        raw = member(row, 'address', 'profile site count')
+        address = int(raw, 0) if isinstance(raw, str) else raw
+        count = member(row, 'executions', 'profile site count')
         if (type(address) is not int or not 0 <= address < 1 << 64
                 or type(count) is not int or count < 0 or address in result):
             raise ValueError('profile contains an invalid or duplicate execution count')
@@ -43,11 +68,11 @@ def read_profile(path, input_sha256):
     return result
 
 
-def sequence(site):
+def sequence(site: 'Site') -> list[ix.Instruction]:
     return site.sequence or site.insns + ([site.tail] if site.tail is not None else [])
 
 
-def region_safe(ins, *, glue=False, allow_loads=False):
+def region_safe(ins: ix.Instruction, *, glue: bool = False, allow_loads: bool = False) -> bool:
     if ins.is_invalid or ins.has_lock_prefix or ins.is_privileged or ins.flow_control != ix.FlowControl.NEXT:
         return False
     if glue and ins.mnemonic not in GLUE:
@@ -77,25 +102,26 @@ def region_safe(ins, *, glue=False, allow_loads=False):
     return True
 
 
-def group(sites, targets, protected_ranges, recovery, *, weights=None,
-          max_instructions=24, max_bytes=96, allow_loads=False):
+def group(sites: Iterable['Site'], targets: Iterable[int], protected_ranges: Iterable[tuple[int, int]],
+          recovery: BlockRecovery, *, weights: Mapping[int, int] | None = None,
+          max_instructions: int = 24, max_bytes: int = 96, allow_loads: bool = False) -> list['Site']:
     """Merge within recovered function/block bounds, without known interior entries."""
     protected = sorted(targets)
     spans = sorted(protected_ranges)
     starts = [a for a, _ in spans]
-    ends = []
+    ends: list[int] = []
     for _, end in spans:
         ends.append(max(end, ends[-1] if ends else 0))
 
-    def occupied(a, b):
+    def occupied(a: int, b: int) -> bool:
         index = bisect.bisect_left(protected, a)
         return index < len(protected) and protected[index] < b
 
-    def protected_bytes(a, b):
+    def protected_bytes(a: int, b: int) -> bool:
         index = bisect.bisect_left(starts, b) - 1
         return index >= 0 and ends[index] > a
 
-    grouped = []
+    grouped: list['Site'] = []
     for candidate in sites:
         if not grouped:
             grouped.append(candidate)
@@ -110,7 +136,7 @@ def group(sites, targets, protected_ranges, recovery, *, weights=None,
         if weights is not None:
             eligible &= all(weights.get(i.ip, 0) > 0 for i in previous.insns + candidate.insns)
         old_steps, new_steps = sequence(previous), sequence(candidate)
-        glue = []
+        glue: list[ix.Instruction] = []
         address = previous.end
         if eligible:
             while address < candidate.ip and len(glue) < max_instructions:
@@ -132,13 +158,16 @@ def group(sites, targets, protected_ranges, recovery, *, weights=None,
     return grouped
 
 
-def shared_lowering(steps, hints, *, allow_loads=False):
+def shared_lowering(steps: Sequence[ix.Instruction], hints: Mapping[int, 'Hints'], *,
+                    allow_loads: bool = False) -> tuple[list[str], list[str | None], list[str], SharedFrame]:
     """Return prefix, per-instruction bodies, suffix, and shared-save report.
 
     None bodies are original glue instructions relocated by iced-x86. Every
     arithmetic body is generated by lower.lower; no second implementation of
     instruction semantics is introduced here.
     """
+    used_gprs: set[int]
+    used_xmms: set[int]
     used_gprs, used_xmms = set(), set()
     for ins in steps:
         if not region_safe(ins, glue=ins.mnemonic not in lower.SUPPORTED, allow_loads=allow_loads):
@@ -153,7 +182,7 @@ def shared_lowering(steps, hints, *, allow_loads=False):
     free_xmms = frozenset(r for r in range(ix.Register.XMM0, ix.Register.XMM15 + 1)
                           if r not in used_xmms)
     free_xmms = frozenset(sorted(free_xmms)[:3])
-    bodies = []
+    bodies: list[str | None] = []
     for ins in steps:
         if ins.mnemonic not in lower.SUPPORTED:
             bodies.append(None)

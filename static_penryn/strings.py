@@ -7,11 +7,18 @@ pinned core's arithmetic is unchanged.  Ordinary SysV stack requirements
 still apply: this is not a Go stack-growth check or unwind implementation.
 """
 
+from collections.abc import Iterable
 import json
+import os
 from pathlib import Path
 import subprocess
+from typing import TypedDict
 
-from iced_x86 import Code, Decoder, FlowControl, InstructionInfoFactory, Mnemonic, OpKind, Register
+from elftools.elf.elffile import ELFFile
+from elftools.elf.relocation import RelocationSection
+from elftools.elf.sections import SymbolTableSection
+from iced_x86 import (Code, Decoder, FlowControl, Instruction, InstructionInfoFactory, Mnemonic,
+                      OpKind, Register)
 
 from .lower import memory_load
 
@@ -44,7 +51,21 @@ STACK_BYTES_BEFORE_HELPER = _ORIGINAL_RSP + 15 + 8
 MAX_STACK_BYTES = 512
 
 
-def specialization(ins):
+class HelperAudit(TypedDict):
+    """One audited helper in build_helpers' report."""
+    name: str
+    code_bytes: int
+    max_stack_bytes: int
+
+
+class HelperReport(TypedDict):
+    """build_helpers' audit report, recorded in the patch report."""
+    specializations: list[HelperAudit]
+    saved_xmm_registers: list[int]
+    max_stack_bytes: int
+
+
+def specialization(ins: Instruction) -> tuple[int, int, int]:
     if ins.mnemonic not in SUPPORTED:
         raise ValueError(f"not a PCMPxSTRx instruction: {ins}")
     explicit = ins.mnemonic in (
@@ -65,21 +86,19 @@ def specialization(ins):
     return mode, int(mask), control
 
 
-def helper_name(key):
+def helper_name(key: tuple[int, int, int]) -> str:
     mode, mask, control = key
     return f"penryn_pcmp_{mode}_{mask}_{control:02x}"
 
 
-def build_helpers(instructions, core, work):
+def build_helpers(instructions: Iterable[Instruction], core: str | os.PathLike[str],
+                  work: str | os.PathLike[str]) -> tuple[Path, HelperReport]:
     """Return (object path, audit report) for the referenced specializations.
 
     The caller validates the pinned core hashes.  This function also serves
     the native differential harness, which accepts an explicit --core path.
     No unchecked compiler ABI assumption is used to drop register saves.
     """
-    from elftools.elf.elffile import ELFFile
-    from elftools.elf.relocation import RelocationSection
-
     keys = sorted({specialization(ins) for ins in instructions if ins.mnemonic in SUPPORTED})
     work, core = Path(work), Path(core)
     source = work / "strings-specialized.c"
@@ -96,11 +115,11 @@ def build_helpers(instructions, core, work):
         "-fno-omit-frame-pointer", "-mno-omit-leaf-frame-pointer",
         "-fstack-usage", "-I" + str(core), "-c", str(source), "-o", str(obj),
     ], check=True)
-    usages = {}
+    usages: dict[str, tuple[int, str]] = {}
     for line in obj.with_suffix(".su").read_text().splitlines():
         function, size, kind = line.rsplit("\t", 2)
         usages[function.rsplit(":", 1)[-1]] = (int(size), kind)
-    helpers = []
+    helpers: list[HelperAudit] = []
     info_factory = InstructionInfoFactory()
     with obj.open("rb") as handle:
         elf = ELFFile(handle)
@@ -112,12 +131,15 @@ def build_helpers(instructions, core, work):
             # A relocation in an apparent local JMP could conceal a tail
             # call until link time.  Only read-only, non-executable constants
             # are permitted outside the already audited helper section.
-            section_index = elf.get_section_index(section.name)
+            section_index: int | None = elf.get_section_index(section.name)
             for relocations in elf.iter_sections():
                 if not isinstance(relocations, RelocationSection) or relocations["sh_info"] != section_index:
                     continue
                 symbols = elf.get_section(relocations["sh_link"])
                 for relocation in relocations.iter_relocations():
+                    if not isinstance(symbols, SymbolTableSection):
+                        raise ValueError(f"string helper {name} relocations do not link a symbol table: "
+                                         f"{relocations.name} -> {symbols.name}")
                     symbol = symbols.get_symbol(relocation["r_info_sym"])
                     target_index = symbol["st_shndx"]
                     if not isinstance(target_index, int):
@@ -151,7 +173,7 @@ def build_helpers(instructions, core, work):
                  "max_stack_bytes": max((h["max_stack_bytes"] for h in helpers), default=0)}
 
 
-def lower(ins):
+def lower(ins: Instruction) -> str:
     """Return a preserving body for legacy PCMPISTRI/M or PCMPESTRI/M."""
     key = specialization(ins)
     mode, mask, _ = key

@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """Exhaustive/random/page-boundary tests for the stack-neutral Go counter."""
+from collections.abc import Iterator
 import io
-import json
 import os
 from pathlib import Path
 import resource
+import struct
 import subprocess
 import tempfile
+from typing import ClassVar
 import unittest
+from unittest.mock import patch
 
 from elftools.elf.elffile import ELFFile
+from elftools.elf.sections import Section, SymbolTableSection
+from elftools.elf.segments import Segment
+from iced_x86 import Decoder
 
 from static_penryn import go_inplace
+from static_penryn.gometa import GoMetadata
 
 
 BRIDGES = r'''
@@ -226,9 +233,26 @@ func main(){
 '''
 
 
+class UnparsedELF(ELFFile):
+    """No ELF at all: the pinned-input refusals raise before reading one."""
+    def __init__(self) -> None:
+        pass
+
+
+def missing_metadata() -> GoMetadata:
+    """No Go functions."""
+    return GoMetadata(parser='', tables=[], rejected_candidates=[])
+
+
 class InplaceTests(unittest.TestCase):
+    temporary: ClassVar[tempfile.TemporaryDirectory[str]]
+    work: ClassVar[Path]
+    body: ClassVar[bytes]
+    symbols: ClassVar[dict[str, int]]
+    binary: ClassVar[Path]
+
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
         cls.temporary = tempfile.TemporaryDirectory(prefix='penryn-inplace-test-')
         cls.work = Path(cls.temporary.name)
@@ -241,41 +265,43 @@ class InplaceTests(unittest.TestCase):
                        check=True, capture_output=True)
 
     @classmethod
-    def tearDownClass(cls):
+    def tearDownClass(cls) -> None:
         cls.temporary.cleanup()
 
-    def test_native_exhaustive_random_guard_pages_and_register_contract(self):
+    def test_native_exhaustive_random_guard_pages_and_register_contract(self) -> None:
         result=subprocess.run([str(self.binary)],check=True,capture_output=True,text=True,timeout=120)
         self.assertIn('PASS',result.stdout)
         print(result.stdout.strip(),flush=True)
 
-    def test_penryn_exhaustive_random_guard_pages_and_register_contract(self):
+    def test_penryn_exhaustive_random_guard_pages_and_register_contract(self) -> None:
         env=dict(os.environ);env.pop('LD_PRELOAD',None);env.pop('LD_LIBRARY_PATH',None)
         result=subprocess.run(['qemu-x86_64','-cpu','Penryn','-U','LD_PRELOAD','-U','LD_LIBRARY_PATH',str(self.binary)],
                               env=env,check=True,capture_output=True,text=True,timeout=180)
         self.assertIn('PASS',result.stdout)
 
-    def test_wrong_binary_and_missing_metadata_refused(self):
+    def test_wrong_binary_and_missing_metadata_refused(self) -> None:
         with self.assertRaisesRegex(ValueError,'pinned agy'):
-            go_inplace.plan(b'unknown',None,{})
+            go_inplace.plan(b'unknown',UnparsedELF(),missing_metadata())
 
-    def test_static_stack_and_isa_audit(self):
+    def test_static_stack_and_isa_audit(self) -> None:
         self.assertEqual(len(self.body),448)
         with self.assertRaisesRegex(ValueError,'RSP'):
             go_inplace.audit(b'\x48\x83\xec\x08\xc3',5,5)
         with self.assertRaisesRegex(ValueError,'unexpected'):
             go_inplace.audit(b'\xf3\x48\x0f\xb8\xc0\xc3',6,6)
 
-    def test_go_count_and_countstring_gc_and_stack_growth(self):
+    def test_go_count_and_countstring_gc_and_stack_growth(self) -> None:
         source=self.work/'main.go';source.write_text(GO_TEST)
         binary=self.work/'go-count'
         env=dict(os.environ,CGO_ENABLED='0',GOAMD64='v1',GOCACHE=str(self.work/'go-cache'))
         subprocess.run(['go','build','-o',str(binary),str(source)],env=env,check=True,capture_output=True,timeout=180)
         data=bytearray(binary.read_bytes());elf=ELFFile(io.BytesIO(data))
-        syms={s.name:s for s in elf.get_section_by_name('.symtab').iter_symbols()}
+        symtab=elf.get_section_by_name('.symtab');assert isinstance(symtab,SymbolTableSection)
+        syms={s.name:s for s in symtab.iter_symbols()}
         symbol=syms['countbody'];start=symbol['st_value'];size=symbol['st_size']
         self.assertGreaterEqual(size,self.symbols['countbody_end'])
-        section=elf.get_section(symbol['st_shndx']);offset=section['sh_offset']+start-section['sh_addr']
+        index=symbol['st_shndx'];assert isinstance(index,int)
+        section=elf.get_section(index);offset=section['sh_offset']+start-section['sh_addr']
         # Fixture-only substitution: this is not a way around plan()'s input
         # and metadata checks. The deployed recipe remains pinned to agy.
         data[offset:offset+size]=self.body[:self.symbols['countbody_end']]+b'\xcc'*(size-self.symbols['countbody_end'])
@@ -287,8 +313,7 @@ class InplaceTests(unittest.TestCase):
 
 
 class DispatchTests(unittest.TestCase):
-    def test_zero_capability_excludes_instruction_but_not_bypass(self):
-        from iced_x86 import Decoder
+    def test_zero_capability_excludes_instruction_but_not_bypass(self) -> None:
         # cmp byte [rip+0x20],0; je safe; popcnt rax,rax; safe: ret
         code=bytes.fromhex('803d2000000000 7405 f3480fb8c0 c3')
         instructions=list(Decoder(64,code,ip=0x1000))
@@ -298,28 +323,34 @@ class DispatchTests(unittest.TestCase):
         # A second entry bypasses the check. No forced branch applies there.
         self.assertIn(0x1009,go_inplace.reachable(instructions[2:],forced))
 
-    def test_unknown_dispatch_input_refused(self):
+    def test_unknown_dispatch_input_refused(self) -> None:
         with self.assertRaisesRegex(ValueError,'pinned agy'):
-            go_inplace.dormant(b'unknown',None,{})
+            go_inplace.dormant(b'unknown',UnparsedELF(),missing_metadata())
 
-    def test_helper_references_cannot_bypass_guard_or_escape(self):
-        import struct
-        from unittest.mock import patch
-        class Section(dict):
-            def data(self):return self['blob']
-        class Elf:
-            def __init__(self,data):self.data=data
-            def iter_sections(self):
-                return iter([Section(sh_flags=6,sh_type='SHT_PROGBITS',sh_addr=0x1000,blob=self.data[:0x30])])
-            def iter_segments(self):
-                return iter([dict(p_type='PT_LOAD',p_flags=5,p_vaddr=0x1000,p_offset=0,p_filesz=len(self.data))])
-        metadata={'tables':[{'functions':[{'name':'caller','start':0x1000,'end':0x1020},
-                                          {'name':'helper','start':0x1020,'end':0x1030}]}]}
-        def run(code,extra=b''):
+    def test_helper_references_cannot_bypass_guard_or_escape(self) -> None:
+        # pyelftools' Section and Segment read item lookups from self.header.
+        class Text(Section):
+            def __init__(self,*,blob:bytes,**header:int|str) -> None:self.blob=blob;self.header=header
+            def data(self) -> bytes:return self.blob
+        class Load(Segment):
+            def __init__(self,**header:int|str) -> None:self.header=header
+        class Elf(ELFFile):
+            def __init__(self,data:bytes) -> None:self.data=data
+            def iter_sections(self,type:str|None=None) -> Iterator[Section]:
+                return iter([Text(sh_flags=6,sh_type='SHT_PROGBITS',sh_addr=0x1000,blob=self.data[:0x30])])
+            def iter_segments(self,type:str|None=None) -> Iterator[Segment]:
+                return iter([Load(p_type='PT_LOAD',p_flags=5,p_vaddr=0x1000,p_offset=0,p_filesz=len(self.data))])
+        # Only tables, functions, start and end are read; the other keys are zero.
+        metadata:GoMetadata={'tables':[{'functions':[{'name':'caller','start':0x1000,'end':0x1020,'metadata_address':0},
+                                                     {'name':'helper','start':0x1020,'end':0x1030,'metadata_address':0}],
+                                        'address':0,'text':0,'text_source':''}],
+                             'parser':'','rejected_candidates':[]}
+        def run(code:bytes,extra:bytes=b'') -> list[tuple[int,int]]:
             data=code+b'\x90'*(0x20-len(code))+b'\xc3'+b'\x90'*15+extra
             return go_inplace._closed_direct_references(data,Elf(data),metadata,[(0x1020,0x1030)],{0x1020})
         with patch.object(go_inplace,'CRC_CALLS',{0x1000:0x1020}):
-            self.assertEqual(run(b'\xe8'+struct.pack('<i',0x1b)+b'\xc3'),[(0x1000,0x1020)])
+            closure=[(0x1000,0x1020)]
+            self.assertEqual(run(b'\xe8'+struct.pack('<i',0x1b)+b'\xc3'),closure)
             with self.assertRaisesRegex(ValueError,'bypasses'):
                 run(b'\xe8'+struct.pack('<i',0x1c)+b'\xc3')
             with self.assertRaisesRegex(ValueError,'bypasses'):

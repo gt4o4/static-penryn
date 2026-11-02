@@ -9,10 +9,22 @@ limitation of the offline rewriter.
 Dynamic table/RELR format: https://gabi.xinuos.com/elf/09-dynamic.html
 """
 import bisect
-import struct
+from typing import TypedDict
+
+from elftools.elf.elffile import ELFFile
+from elftools.elf.segments import Segment
+
+from .checked import iter_ints, unpack_ints
 
 
-def validate_elf(data, elf):
+class ElfMetadata(TypedDict):
+    relocation_ranges: list[tuple[int, int]]
+    pointer_targets: set[int]
+    # (address, file offset, size) of RX bytes outside executable sections
+    uncovered_executable_ranges: list[tuple[int, int, int]]
+
+
+def validate_elf(data: bytes | bytearray, elf: ELFFile) -> ElfMetadata:
     """Return pointer targets, loader relocation spans and unscanned RX ranges.
 
     Fail closed for malformed/ambiguous mappings; support ordinary stripped
@@ -21,7 +33,7 @@ def validate_elf(data, elf):
     """
     size = len(data)
 
-    def file_range(start, count, what):
+    def file_range(start: int, count: int, what: str) -> None:
         if start < 0 or count < 0 or start > size or count > size - start:
             raise ValueError(f'{what} extends outside the input file')
 
@@ -50,7 +62,10 @@ def validate_elf(data, elf):
         if alignment > 1 and (alignment & (alignment - 1)
                               or (seg['p_vaddr'] - seg['p_offset']) % alignment):
             raise ValueError('PT_LOAD has invalid alignment or offset/address congruence')
-    ordered = sorted(loads, key=lambda s: s['p_vaddr'])
+    def vaddr(seg: Segment) -> int:
+        return seg['p_vaddr']
+
+    ordered = sorted(loads, key=vaddr)
     for left, right in zip(ordered, ordered[1:]):
         if left['p_vaddr'] + left['p_memsz'] > right['p_vaddr']:
             raise ValueError('overlapping PT_LOAD virtual ranges are ambiguous')
@@ -58,13 +73,13 @@ def validate_elf(data, elf):
     load_ranges = [(s['p_vaddr'], s['p_vaddr'] + s['p_filesz'],
                     s['p_vaddr'] + s['p_memsz'], s['p_offset']) for s in ordered]
 
-    def mapped(address, count=1, *, file_backed=True):
+    def mapped(address: int, count: int = 1, *, file_backed: bool = True) -> Segment:
         index = bisect.bisect_right(load_starts, address) - 1
         if index < 0 or count < 0 or address + count > load_ranges[index][1 if file_backed else 2]:
             raise ValueError(f'address range 0x{address:x}+{count} is not uniquely PT_LOAD mapped')
         return ordered[index]
 
-    def read_va(address, count):
+    def read_va(address: int, count: int) -> memoryview:
         index = bisect.bisect_right(load_starts, address) - 1
         if index < 0 or count < 0 or address + count > load_ranges[index][1]:
             raise ValueError(f'address range 0x{address:x}+{count} is not file-backed PT_LOAD mapped')
@@ -75,7 +90,7 @@ def validate_elf(data, elf):
     sections = list(elf.iter_sections())
     if sections[elf['e_shstrndx']]['sh_type'] != 'SHT_STRTAB':
         raise ValueError('section-name table is not SHT_STRTAB')
-    executable = []
+    executable: list[tuple[int, int]] = []
     for sec in sections:
         count = sec['sh_size']
         if sec['sh_type'] != 'SHT_NOBITS':
@@ -104,21 +119,21 @@ def validate_elf(data, elf):
     executable.sort()
     if not executable:
         raise ValueError('ELF has no file-backed executable sections')
-    for left, right in zip(executable, executable[1:]):
-        if left[1] > right[0]:
+    for left_range, right_range in zip(executable, executable[1:]):
+        if left_range[1] > right_range[0]:
             raise ValueError('overlapping executable sections are ambiguous')
     starts = [a for a, _ in executable]
     low, high = executable[0][0], executable[-1][1]
 
-    def is_code(value):
+    def is_code(value: int) -> bool:
         if not low <= value < high:
             return False
         index = bisect.bisect_right(starts, value) - 1
         return value < executable[index][1]
 
-    targets = set()
+    targets: set[int] = set()
 
-    def add_target(value):
+    def add_target(value: int) -> None:
         if is_code(value):
             targets.add(value)
 
@@ -134,15 +149,15 @@ def validate_elf(data, elf):
             if begin >= end:
                 continue
             end -= (end - begin) % 8
-            for (value,) in struct.iter_unpack('<Q', memoryview(data)[begin:end]):
+            for (value,) in iter_ints('<Q', memoryview(data)[begin:end]):
                 if low <= value < high:
                     add_target(value)
 
-    relocation_ranges = set()
+    relocation_ranges: set[tuple[int, int]] = set()
     dynamic = [s for s in segments if s['p_type'] == 'PT_DYNAMIC']
     if len(dynamic) > 1:
         raise ValueError('multiple PT_DYNAMIC segments are unsupported')
-    tags = {}
+    tags: dict[int, int] = {}
     if dynamic:
         seg = dynamic[0]
         container = mapped(seg['p_vaddr'], seg['p_filesz'])
@@ -151,7 +166,7 @@ def validate_elf(data, elf):
         if seg['p_filesz'] % 16:
             raise ValueError('PT_DYNAMIC has a truncated entry')
         found_null = False
-        for tag, value in struct.iter_unpack('<qQ', memoryview(data)[seg['p_offset']:seg['p_offset'] + seg['p_filesz']]):
+        for tag, value in iter_ints('<qQ', memoryview(data)[seg['p_offset']:seg['p_offset'] + seg['p_filesz']]):
             if tag == 0:
                 found_null = True
                 break
@@ -162,16 +177,16 @@ def validate_elf(data, elf):
         if not found_null:
             raise ValueError('PT_DYNAMIC has no DT_NULL terminator')
 
-    symbol_cache = {0: (0, 0)}
+    symbol_cache: dict[int, tuple[int, int]] = {0: (0, 0)}
 
-    def symbol(index):
+    def symbol(index: int) -> tuple[int, int]:
         if index in symbol_cache:
             return symbol_cache[index]
         if not index:
             return 0, 0
         if 6 not in tags or tags.get(11) != 24:
             raise ValueError('dynamic relocation requires a valid DT_SYMTAB/DT_SYMENT')
-        _, _, _, section_index, value, sym_size = struct.unpack('<IBBHQQ', read_va(tags[6] + index * 24, 24))
+        _, _, _, section_index, value, sym_size = unpack_ints('<IBBHQQ', read_va(tags[6] + index * 24, 24))
         symbol_cache[index] = (value if section_index else 0), sym_size
         return symbol_cache[index]
 
@@ -181,7 +196,7 @@ def validate_elf(data, elf):
               26: 4, 27: 8, 28: 8, 29: 8, 30: 8, 31: 8, 32: 4, 33: 8,
               34: 4, 35: 0, 36: 16, 37: 8, 38: 8, 41: 4, 42: 4, 43: 4}
 
-    def relocation(where, info, addend):
+    def relocation(where: int, info: int, addend: int | None) -> None:
         kind, sym = info & 0xffffffff, info >> 32
         if not kind:
             return
@@ -196,15 +211,15 @@ def validate_elf(data, elf):
             add_target(value + addend)
         elif kind in (1, 8, 37, 38):
             # REL stores its addend at the destination instead of in the table.
-            add_target(value + struct.unpack('<Q', read_va(where, 8))[0])
+            add_target(value + unpack_ints('<Q', read_va(where, 8))[0])
 
-    def table(address, count, entry, rela):
+    def table(address: int, count: int, entry: int, rela: bool) -> None:
         expected = 24 if rela else 16
         if entry != expected or count % entry:
             raise ValueError('dynamic relocation table has invalid entry size')
         if not count:
             return
-        for fields in struct.iter_unpack('<QQq' if rela else '<QQ', read_va(address, count)):
+        for fields in iter_ints('<QQq' if rela else '<QQ', read_va(address, count)):
             relocation(fields[0], fields[1], fields[2] if rela else None)
 
     for address_tag, size_tag, entry_tag, rela in ((7, 8, 9, True), (17, 18, 19, False)):
@@ -221,8 +236,8 @@ def validate_elf(data, elf):
     if 36 in tags:  # DT_RELR: address words interspersed with 63-word bitmaps.
         if tags.get(37) != 8 or 35 not in tags or tags[35] % 8:
             raise ValueError('invalid DT_RELR metadata')
-        next_address = None
-        for (entry,) in struct.iter_unpack('<Q', read_va(tags[36], tags[35])):
+        next_address: int | None = None
+        for (entry,) in iter_ints('<Q', read_va(tags[36], tags[35])):
             if not entry & 1:
                 places = [entry]
                 next_address = entry + 8
@@ -235,7 +250,7 @@ def validate_elf(data, elf):
                 mapped(where, 8, file_backed=False)
                 relocation_ranges.add((where, where + 8))
                 try:
-                    add_target(struct.unpack('<Q', read_va(where, 8))[0])
+                    add_target(unpack_ints('<Q', read_va(where, 8))[0])
                 except ValueError:
                     # Zero-initialized BSS has no file-backed pointer addend.
                     pass
@@ -245,20 +260,20 @@ def validate_elf(data, elf):
 
     # Data and ELF headers may intentionally share an RX mapping (notably agy),
     # so report gaps instead of interpreting all bytes as executable code.
-    uncovered = []
+    uncovered: list[tuple[int, int, int]] = []
     for seg in loads:
         if not seg['p_flags'] & 1:
             continue
-        cursor, end = seg['p_vaddr'], seg['p_vaddr'] + seg['p_filesz']
+        cursor, stop = seg['p_vaddr'], seg['p_vaddr'] + seg['p_filesz']
         for a, b in executable:
-            if b <= cursor or a >= end:
+            if b <= cursor or a >= stop:
                 continue
             if cursor < a:
                 uncovered.append((cursor, seg['p_offset'] + cursor - seg['p_vaddr'], a - cursor))
             cursor = max(cursor, b)
-        if cursor < end:
-            uncovered.append((cursor, seg['p_offset'] + cursor - seg['p_vaddr'], end - cursor))
-    merged_ranges = []
+        if cursor < stop:
+            uncovered.append((cursor, seg['p_offset'] + cursor - seg['p_vaddr'], stop - cursor))
+    merged_ranges: list[tuple[int, int]] = []
     for start, end in sorted(relocation_ranges):
         if merged_ranges and start <= merged_ranges[-1][1]:
             merged_ranges[-1] = (merged_ranges[-1][0], max(end, merged_ranges[-1][1]))

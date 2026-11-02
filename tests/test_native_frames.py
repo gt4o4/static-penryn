@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """Native frame proofs and counterexamples from linked, decoded CFG fixtures."""
 import io
-import json
 from pathlib import Path
 import resource
 import shutil
 import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
+from typing import TYPE_CHECKING
 import unittest
-from unittest.mock import Mock, patch
 
 import iced_x86 as ix
+from elftools.dwarf.callframe import CIE, FDE, ZERO, DecodedCallFrameTable
+from elftools.dwarf.dwarfinfo import DWARFInfo
 from elftools.elf.elffile import ELFFile
-from elftools.elf.sections import SymbolTableSection
+from elftools.elf.sections import Section, SymbolTableSection
 
-from static_penryn import controlflow
-from static_penryn.native_frames import Gap, Recovery
+from static_penryn import checked, controlflow, unwind
+from static_penryn.native_frames import Gap, Recovery, RowEvidence, row_cfa, row_rule
+from . import test_runtime as fixtures
+
+if TYPE_CHECKING:
+    from elftools.dwarf.callframe import CFIRow
 
 
 # Claude 2.1.278 input SHA256 b03ee84fce76643c414d868815ad3b74bfa856dda17bc0eb0da39d982213c1f7.
@@ -47,12 +51,12 @@ CLAUDE_HOT = bytes.fromhex(
 
 class NativeFramesTests(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         if not shutil.which('gcc'):
             raise unittest.SkipTest('gcc is required for ELF fixtures')
 
-    def recover(self, body, *, extra='', stripped=False, caller='call target; ret',
-                addresses=(), **options):
+    def recover(self, body: str, *, extra: str = '', stripped: bool = False, caller: str = 'call target; ret',
+                addresses: tuple[str, ...] = (), **options: int) -> tuple[Recovery, dict[str, int]]:
         source = f'''.intel_syntax noprefix
 .text
 .global _start
@@ -90,22 +94,29 @@ target:
         recovery.finish(address_taken=[symbols[name] for name in addresses])
         return recovery, symbols
 
-    def rule(self, row, register):
-        return row[register].type, row[register].arg
+    def rule(self, row: 'CFIRow', register: int) -> tuple[str, int | list[int] | None]:
+        rule = row_rule(row, register)
+        assert rule is not None, f'no rule for DWARF register {register}'
+        return rule.type, rule.arg
 
-    def test_exact_claude_hot_routine_whole_cfg(self):
+    def evidence(self, recovery: Recovery, pc: int) -> RowEvidence:
+        evidence = recovery.evidence(pc)
+        assert evidence is not None, f'no decision recorded for {pc:#x}'
+        return evidence
+
+    def test_exact_claude_hot_routine_whole_cfg(self) -> None:
         body = '.byte ' + ','.join(hex(byte) for byte in CLAUDE_HOT)
         recovery, symbols = self.recover(body, stripped=True)
         for original_pc in (0x3a2dacc, 0x3a2dae1, 0x3a2daf4, 0x3a2db0c):
             pc = symbols['target'] + original_pc - 0x3a2d8e0
             with self.subTest(original_pc=hex(original_pc)):
                 row = recovery.row(pc)
-                self.assertEqual((row['cfa'].reg, row['cfa'].offset), (6, 16))
+                self.assertEqual((row_cfa(row).reg, row_cfa(row).offset), (6, 16))
                 self.assertEqual(self.rule(row, 6), ('OFFSET', -16))
                 self.assertEqual(self.rule(row, 3), ('OFFSET', -24))
-                self.assertGreater(recovery.evidence(pc)['reachable_instructions'], 200)
+                self.assertGreater(self.evidence(recovery, pc)['reachable_instructions'], 200)
 
-    def test_conventional_frame_and_every_epilogue_transition(self):
+    def test_conventional_frame_and_every_epilogue_transition(self) -> None:
         recovery, symbols = self.recover('''
 push rbp
 set_frame: mov rbp, rsp
@@ -117,15 +128,15 @@ done: ret
 ''')
         rows = {name: recovery.row(symbols[name]) for name in
                 ('target', 'set_frame', 'save_rbx', 'body', 'pop_bx', 'pop_bp', 'done')}
-        self.assertEqual((rows['target']['cfa'].reg, rows['target']['cfa'].offset), (7, 8))
-        self.assertEqual((rows['set_frame']['cfa'].reg, rows['set_frame']['cfa'].offset), (7, 16))
-        self.assertEqual((rows['body']['cfa'].reg, rows['body']['cfa'].offset), (6, 16))
+        self.assertEqual((row_cfa(rows['target']).reg, row_cfa(rows['target']).offset), (7, 8))
+        self.assertEqual((row_cfa(rows['set_frame']).reg, row_cfa(rows['set_frame']).offset), (7, 16))
+        self.assertEqual((row_cfa(rows['body']).reg, row_cfa(rows['body']).offset), (6, 16))
         self.assertEqual(self.rule(rows['body'], 6), ('OFFSET', -16))
         self.assertEqual(self.rule(rows['pop_bx'], 3), ('OFFSET', -24))
         self.assertEqual(self.rule(rows['pop_bp'], 3), ('SAME_VALUE', None))
-        self.assertEqual((rows['done']['cfa'].reg, rows['done']['cfa'].offset), (7, 8))
+        self.assertEqual((row_cfa(rows['done']).reg, row_cfa(rows['done']).offset), (7, 8))
 
-    def test_frameless_stack_save_restore(self):
+    def test_frameless_stack_save_restore(self) -> None:
         recovery, symbols = self.recover('''
 sub rsp, 24
 mov [rsp+8], rbx
@@ -136,31 +147,33 @@ add rsp, 24
 ret
 ''')
         row = recovery.row(symbols['body'])
-        self.assertEqual((row['cfa'].reg, row['cfa'].offset), (7, 32))
+        self.assertEqual((row_cfa(row).reg, row_cfa(row).offset), (7, 32))
         self.assertEqual(self.rule(row, 3), ('OFFSET', -24))
 
-    def test_leave_restores_incoming_rbp(self):
+    def test_leave_restores_incoming_rbp(self) -> None:
         recovery, symbols = self.recover('push rbp; mov rbp,rsp; sub rsp,32; body: nop; leave; done: ret')
-        self.assertEqual(recovery.row(symbols['body'])['cfa'].reg, 6)
+        self.assertEqual(row_cfa(recovery.row(symbols['body'])).reg, 6)
         self.assertEqual(self.rule(recovery.row(symbols['done']), 6), ('SAME_VALUE', None))
 
-    def test_stripped_direct_call_is_entry_evidence(self):
+    def test_stripped_direct_call_is_entry_evidence(self) -> None:
         recovery, symbols = self.recover('body: popcnt rax,rdi; ret', stripped=True)
         row = recovery.row(symbols['body'])
-        self.assertEqual((row['cfa'].reg, row['cfa'].offset), (7, 8))
-        evidence = recovery.evidence(symbols['body'])
-        self.assertEqual(evidence['entry_sources'], ['direct-call'])
+        self.assertEqual((row_cfa(row).reg, row_cfa(row).offset), (7, 8))
+        evidence = self.evidence(recovery, symbols['body'])
+        direct: list[str] = ['direct-call']
+        self.assertEqual(evidence['entry_sources'], direct)
         self.assertFalse(evidence['compiler_authored'])
         self.assertFalse(evidence['unknown_indirect_entries_excluded'])
 
-    def dispatcher(self, body, *, extra='', addresses=()):
+    def dispatcher(self, body: str, *, extra: str = '',
+                   addresses: tuple[str, ...] = ()) -> tuple[Recovery, dict[str, int]]:
         return self.recover(body, stripped=True,
             caller='mov rcx,[rip+slot]; mov edi,1; call rcx; ret',
             extra='''leaf: hot: popcnt rax,rdi; ret
 other_leaf: popcnt rax,rsi; ret
 ''' + extra + '\n.data\nslot: .quad target', addresses=addresses)
 
-    def test_indirect_call_slot_and_constant_tail_dispatch_prove_entry(self):
+    def test_indirect_call_slot_and_constant_tail_dispatch_prove_entry(self) -> None:
         recovery, symbols = self.dispatcher('''
 mov ecx, OFFSET FLAT: leaf
 test edi,edi
@@ -170,13 +183,15 @@ joined: mov [rip+slot],rcx
 jmp rcx
 ''')
         row = recovery.row(symbols['hot'])
-        self.assertEqual((row['cfa'].reg, row['cfa'].offset), (7, 8))
-        self.assertEqual(recovery.evidence(symbols['hot'])['entry_sources'], ['verified-dispatch-tail'])
+        self.assertEqual((row_cfa(row).reg, row_cfa(row).offset), (7, 8))
+        dispatched: list[str] = ['verified-dispatch-tail']
+        self.assertEqual(self.evidence(recovery, symbols['hot'])['entry_sources'], dispatched)
         evidence = next(item for item in recovery.dispatchers if item['slot'] == symbols['slot'])
         self.assertTrue(evidence['accepted'])
-        self.assertEqual(evidence['tail_targets'], [symbols['leaf'], symbols['other_leaf']])
+        targets: list[int] = [symbols['leaf'], symbols['other_leaf']]
+        self.assertEqual(evidence['tail_targets'], targets)
 
-    def test_dispatcher_rejects_external_or_partial_slot_changes(self):
+    def test_dispatcher_rejects_external_or_partial_slot_changes(self) -> None:
         for change in ('mov QWORD PTR [rip+slot],0', 'mov byte ptr [rip+slot+7],0'):
             with self.subTest(change=change):
                 recovery, symbols = self.dispatcher('mov ecx, OFFSET FLAT: leaf; mov [rip+slot],rcx; jmp rcx',
@@ -185,7 +200,7 @@ jmp rcx
                     recovery.row(symbols['hot'])
                 self.assertIn('written outside', recovery.dispatchers[0]['reason'])
 
-    def test_dispatcher_rejects_bad_frame_or_unresolved_constant_join(self):
+    def test_dispatcher_rejects_bad_frame_or_unresolved_constant_join(self) -> None:
         bodies = ('push rbp; mov ecx, OFFSET FLAT: leaf; jmp rcx',
                   'mov ecx, OFFSET FLAT: leaf; test edi,edi; jz joined; mov ecx,eax; joined: jmp rcx',
                   'test edi,edi; jz alternate; mov ecx, OFFSET FLAT: leaf; jmp joined; '
@@ -197,7 +212,7 @@ jmp rcx
                     recovery.row(symbols['hot'])
                 self.assertFalse(recovery.dispatchers[0]['accepted'])
 
-    def test_dispatcher_rejects_interior_entries_and_changed_load_register(self):
+    def test_dispatcher_rejects_interior_entries_and_changed_load_register(self) -> None:
         recovery, symbols = self.dispatcher('mov ecx, OFFSET FLAT: leaf; interior: jmp rcx',
                                              addresses=('interior',))
         with self.assertRaises(Gap):
@@ -209,7 +224,7 @@ jmp rcx
         with self.assertRaises(Gap):
             recovery.row(symbols['hot'])
 
-    def test_previous_function_prologue_never_supplies_next_frame(self):
+    def test_previous_function_prologue_never_supplies_next_frame(self) -> None:
         extra = '''.p2align 4
 .type next_function,@function
 next_function: body: popcnt rax,rdi; ret
@@ -218,23 +233,23 @@ next_function: body: popcnt rax,rdi; ret
                                          extra=extra, stripped=True,
                                          caller='call target; call next_function; ret')
         row = recovery.row(symbols['body'])
-        self.assertEqual(recovery.evidence(symbols['body'])['entry'], symbols['next_function'])
-        self.assertEqual((row['cfa'].reg, row['cfa'].offset), (7, 8))
+        self.assertEqual(self.evidence(recovery, symbols['body'])['entry'], symbols['next_function'])
+        self.assertEqual((row_cfa(row).reg, row_cfa(row).offset), (7, 8))
         self.assertEqual(self.rule(row, 6), ('SAME_VALUE', None))
 
-    def test_nearby_prologue_without_entry_is_rejected(self):
+    def test_nearby_prologue_without_entry_is_rejected(self) -> None:
         recovery, symbols = self.recover('push rbp; mov rbp,rsp; pop rbp; ret', stripped=True,
                                          extra='int3; int3; body: popcnt rax,rdi; ret')
         with self.assertRaisesRegex(Gap, 'not reachable'):
             recovery.row(symbols['body'])
 
-    def test_unknown_entry_never_uses_a_prologue_guess(self):
+    def test_unknown_entry_never_uses_a_prologue_guess(self) -> None:
         recovery, symbols = self.recover('push rbp; mov rbp,rsp; body: nop; pop rbp; ret',
                                          stripped=True, caller='ret')
         with self.assertRaisesRegex(Gap, 'no trusted'):
             recovery.row(symbols['body'])
 
-    def test_diamond_intersects_frame_aliases_from_both_predecessors(self):
+    def test_diamond_intersects_frame_aliases_from_both_predecessors(self) -> None:
         recovery, symbols = self.recover('''
 push rbp
 test edi,edi
@@ -247,10 +262,10 @@ pop rbp
 ret
 ''')
         row = recovery.row(symbols['joined'])
-        self.assertEqual((row['cfa'].reg, row['cfa'].offset), (7, 16))
+        self.assertEqual((row_cfa(row).reg, row_cfa(row).offset), (7, 16))
         self.assertEqual(self.rule(row, 6), ('OFFSET', -16))
 
-    def test_diamond_missing_prologue_dominance_rejects(self):
+    def test_diamond_missing_prologue_dominance_rejects(self) -> None:
         recovery, symbols = self.recover('''
 test edi,edi
 jz joined
@@ -263,14 +278,14 @@ ret
         with self.assertRaises(Gap):
             recovery.row(symbols['joined'])
 
-    def test_balanced_loop_converges_but_growing_stack_rejects(self):
+    def test_balanced_loop_converges_but_growing_stack_rejects(self) -> None:
         recovery, symbols = self.recover('loop_body: push rax; pop rax; dec edi; jnz loop_body; ret')
-        self.assertEqual(recovery.row(symbols['loop_body'])['cfa'].offset, 8)
+        self.assertEqual(row_cfa(recovery.row(symbols['loop_body'])).offset, 8)
         recovery, symbols = self.recover('loop_body: push rax; dec edi; jnz loop_body; pop rax; ret')
         with self.assertRaisesRegex(Gap, 'disagree about stack depth'):
             recovery.row(symbols['loop_body'])
 
-    def test_external_branch_and_address_taken_interior_reject(self):
+    def test_external_branch_and_address_taken_interior_reject(self) -> None:
         recovery, symbols = self.recover('push rbp; mov rbp,rsp; body: nop; pop rbp; ret',
                                          extra='outside: jmp body')
         with self.assertRaisesRegex(Gap, 'external direct branch'):
@@ -279,7 +294,7 @@ ret
         with self.assertRaisesRegex(Gap, 'address-taken interior'):
             recovery.row(symbols['body'])
 
-    def test_unknown_edges_pivots_and_unbalanced_returns_reject(self):
+    def test_unknown_edges_pivots_and_unbalanced_returns_reject(self) -> None:
         for body in ('body: jmp rax', 'body: and rsp,-16; ret',
                      'body: mov esp,eax; ret', 'body: push rax; ret',
                      'body: xor ebx,ebx; ret', 'body: ret 8'):
@@ -288,7 +303,7 @@ ret
                 with self.assertRaises(Gap):
                     recovery.row(symbols['body'])
 
-    def test_partial_overwrite_of_saved_value_and_return_address_reject(self):
+    def test_partial_overwrite_of_saved_value_and_return_address_reject(self) -> None:
         for body in ('push rbx; mov byte ptr [rsp+7],0; xor ebx,ebx; body: nop; pop rbx; ret',
                      'body: mov byte ptr [rsp+3],0; ret'):
             with self.subTest(body=body):
@@ -296,7 +311,7 @@ ret
                 with self.assertRaises(Gap):
                     recovery.row(symbols['body'])
 
-    def test_repeated_segmented_or_truncated_stack_writes_reject(self):
+    def test_repeated_segmented_or_truncated_stack_writes_reject(self) -> None:
         for body in ('mov rdi,rsp; body: rep stosq; ret',
                      'body: mov fs:[rsp],rax; ret',
                      'body: mov [esp],eax; ret'):
@@ -305,7 +320,7 @@ ret
                 with self.assertRaises(Gap):
                     recovery.row(symbols['body'])
 
-    def test_call_discards_red_zone_saves_and_caller_saved_aliases(self):
+    def test_call_discards_red_zone_saves_and_caller_saved_aliases(self) -> None:
         recovery, symbols = self.recover('''
 mov [rsp-8],rbx
 xor ebx,ebx
@@ -315,16 +330,16 @@ ret''', extra='helper: ret')
         with self.assertRaisesRegex(Gap, 'no recoverable incoming value'):
             recovery.row(symbols['body'])
 
-    def test_ordinary_calls_preserve_allocated_saves(self):
+    def test_ordinary_calls_preserve_allocated_saves(self) -> None:
         recovery, symbols = self.recover('push rbx; xor ebx,ebx; call helper; body: nop; pop rbx; ret',
                                          extra='helper: ret')
         self.assertEqual(self.rule(recovery.row(symbols['body']), 3), ('OFFSET', -16))
 
-    def test_balanced_direct_tail_call_is_an_exit(self):
+    def test_balanced_direct_tail_call_is_an_exit(self) -> None:
         recovery, symbols = self.recover('body: jmp helper', extra='.type helper,@function\nhelper: ret')
-        self.assertEqual(recovery.row(symbols['body'])['cfa'].offset, 8)
+        self.assertEqual(row_cfa(recovery.row(symbols['body'])).offset, 8)
 
-    def test_instruction_budget_and_lifecycle_are_explicit_gaps(self):
+    def test_instruction_budget_and_lifecycle_are_explicit_gaps(self) -> None:
         recovery, symbols = self.recover('body: nop; nop; nop; ret', max_instructions=2)
         with self.assertRaisesRegex(Gap, 'budget'):
             recovery.row(symbols['body'])
@@ -334,10 +349,9 @@ ret''', extra='helper: ret')
 
 
 class NativeUnwindIntegrationTests(unittest.TestCase):
-    def test_strict_cli_infers_missing_fde_and_unwinds_native_timer(self):
+    def test_strict_cli_infers_missing_fde_and_unwinds_native_timer(self) -> None:
         # Reuse the existing real libgcc signal oracle. Only exercise's CFI is
         # removed; its caller and the C harness retain compiler-authored CFI.
-        from . import test_runtime as fixtures
         _, hard = resource.getrlimit(resource.RLIMIT_CORE)
         resource.setrlimit(resource.RLIMIT_CORE, (0, hard))
         assembly = fixtures.ASM_FIXTURE.replace('BODY', 'popcnt rbx,rax\ncrc32 rdx,rax')
@@ -360,12 +374,14 @@ class NativeUnwindIntegrationTests(unittest.TestCase):
             accepted = subprocess.run(command + ['--infer-unwind'], capture_output=True,
                                       text=True, timeout=90)
             self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
-            report = json.loads(Path(str(output) + '.json').read_text())
-            self.assertTrue(report['unwind']['native_coverage_complete'])
-            self.assertGreaterEqual(report['unwind']['inferred_ranges'], 2)
-            self.assertFalse(report['unwind']['frame_recovery']['compiler_authored'])
+            report = checked.as_object(checked.load_json(Path(str(output) + '.json').read_text()), 'patch report')
+            unwound = checked.as_object(report['unwind'], 'unwind report')
+            self.assertTrue(unwound['native_coverage_complete'])
+            self.assertGreaterEqual(checked.as_int(unwound['inferred_ranges'], 'inferred ranges'), 2)
+            self.assertFalse(checked.as_object(unwound['frame_recovery'], 'frame recovery')['compiler_authored'])
             with output.open('rb') as stream:
                 section = ELFFile(stream).get_section_by_name('.penryn')
+                assert section is not None
                 limits = [hex(section['sh_addr']), hex(section['sh_addr'] + section['sh_size'])]
             result = subprocess.run([str(output), *limits, 'timer'], capture_output=True,
                                     text=True, timeout=25)
@@ -374,47 +390,99 @@ class NativeUnwindIntegrationTests(unittest.TestCase):
             print('inferred native timer:', result.stdout.strip())
 
 
+# Row markers: which table, or the inference, answered a query.
+OUTER, INNER, UNRELATED, INFERRED = range(4)
+
+
+class StandardCIE(CIE):
+    """Return column 16, no signal frame; pyelftools reads items from self.header."""
+    def __init__(self) -> None:
+        self.header = {'return_address_register': 16, 'augmentation': b'zR'}
+
+
+class Frame(FDE):
+    """An FDE for [start, end) whose single decoded row carries a marker."""
+    def __init__(self, start: int, end: int, marker: int) -> None:
+        self.header = {'initial_location': start, 'address_range': end - start}
+        self.cie = StandardCIE()
+        self.rows: list[CFIRow] = [{'pc': start, 'marker': marker}]
+
+    def get_decoded(self) -> DecodedCallFrameTable:
+        return DecodedCallFrameTable(table=self.rows, reg_order=[])
+
+
+class EHFrame(DWARFInfo):
+    """DWARF info that is only these .eh_frame entries."""
+    def __init__(self, entries: list[CIE | FDE | ZERO]) -> None:
+        self.entries = entries
+
+    def has_EH_CFI(self) -> bool:
+        return True
+
+    def EH_CFI_entries(self) -> list[CIE | FDE | ZERO]:
+        return self.entries
+
+
+class Header(Section):
+    """A section that is only its header, from which pyelftools reads items."""
+    def __init__(self, **header: int | str) -> None:
+        self.header = header
+
+
+class FrameELF(ELFFile):
+    """An ELF whose every section lies at 4096 and whose DWARF info is given."""
+    def __init__(self, dwarf: DWARFInfo) -> None:
+        self.dwarf = dwarf
+
+    def get_section_by_name(self, name: str) -> Section | None:
+        return Header(sh_addr=4096)
+
+    def get_dwarf_info(self, relocate_dwarf_sections: bool = True, follow_links: bool = True) -> DWARFInfo:
+        return self.dwarf
+
+
+class Inference(Recovery):
+    """Frame inference that records each query and answers with `result`."""
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+        self.result: CFIRow | None = None
+
+    def row(self, pc: int) -> 'CFIRow':
+        self.calls.append(pc)
+        if self.result is None:
+            raise AssertionError(f'unexpected frame inference at {pc}')
+        return self.result
+
+    def evidence(self, pc: int) -> RowEvidence | None:
+        return None
+
+
 class NativeFDEIndexTests(unittest.TestCase):
-    def index(self):
-        from static_penryn import unwind
-
-        class Frame(dict):
-            def __init__(self, start, end, marker):
-                super().__init__(initial_location=start, address_range=end-start)
-                self.cie = {'return_address_register': 16, 'augmentation': b'zR'}
-                self.rows = [{'pc': start, 'marker': marker}]
-
-            def get_decoded(self):
-                return SimpleNamespace(table=self.rows)
-
-        frames = [Frame(100, 200, 'outer'), Frame(120, 140, 'inner'),
-                  Frame(300, 320, 'unrelated')]
-        dwarf = SimpleNamespace(has_EH_CFI=lambda: True, EH_CFI_entries=lambda: frames)
-        elf = SimpleNamespace(get_section_by_name=lambda name: {'sh_addr': 4096},
-                              get_dwarf_info=lambda **kwargs: dwarf)
-        fallback = Mock()
-        with patch.object(unwind, 'FDE', Frame):
-            index = unwind.Index(elf, frame_recovery=fallback)
+    def index(self) -> tuple[unwind.Index, Inference]:
+        frames: list[CIE | FDE | ZERO] = [Frame(100, 200, OUTER), Frame(120, 140, INNER),
+                                          Frame(300, 320, UNRELATED)]
+        fallback = Inference()
+        index = unwind.Index(FrameELF(EHFrame(frames)), frame_recovery=fallback)
         return index, fallback
 
-    def test_earlier_covering_fde_survives_later_finished_overlap(self):
+    def test_earlier_covering_fde_survives_later_finished_overlap(self) -> None:
         index, fallback = self.index()
-        self.assertEqual(index.row(150)['marker'], 'outer')
-        self.assertEqual(index.row(310)['marker'], 'unrelated')
-        fallback.row.assert_not_called()
+        self.assertEqual(index.row(150)['marker'], OUTER)
+        self.assertEqual(index.row(310)['marker'], UNRELATED)
+        self.assertFalse(fallback.calls)
 
-    def test_ambiguous_overlap_rejects_without_inference(self):
-        from static_penryn import unwind
+    def test_ambiguous_overlap_rejects_without_inference(self) -> None:
         index, fallback = self.index()
         with self.assertRaisesRegex(unwind.Unsupported, 'multiple original FDEs'):
             index.row(130)
-        fallback.row.assert_not_called()
+        self.assertFalse(fallback.calls)
 
-    def test_only_a_real_coverage_gap_invokes_inference(self):
+    def test_only_a_real_coverage_gap_invokes_inference(self) -> None:
         index, fallback = self.index()
-        fallback.row.return_value = {'pc': 200, 'marker': 'inferred'}
-        self.assertEqual(index.row(200)['marker'], 'inferred')
-        fallback.row.assert_called_once_with(200)
+        fallback.result = {'pc': 200, 'marker': INFERRED}
+        self.assertEqual(index.row(200)['marker'], INFERRED)
+        once: list[int] = [200]
+        self.assertEqual(fallback.calls, once)
 
 
 if __name__ == '__main__':

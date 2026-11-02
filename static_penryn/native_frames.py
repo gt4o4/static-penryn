@@ -11,43 +11,127 @@ excluded by static disassembly and are not claimed to have been excluded.
 from array import array
 from bisect import bisect_left, bisect_right
 from collections import Counter, OrderedDict, deque
+from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import iced_x86 as ix
 from elftools.dwarf.callframe import CFARule, RegisterRule
+from elftools.elf.elffile import ELFFile
 from elftools.elf.relocation import RelocationSection
 from elftools.elf.sections import SymbolTableSection
 
+from . import checked
 
-DWARF = {ix.Register.RAX: 0, ix.Register.RDX: 1, ix.Register.RCX: 2,
-         ix.Register.RBX: 3, ix.Register.RSI: 4, ix.Register.RDI: 5,
-         ix.Register.RBP: 6, ix.Register.RSP: 7,
-         **{getattr(ix.Register, f'R{n}'): n for n in range(8, 16)}}
+if TYPE_CHECKING:
+    from elftools.dwarf.callframe import CFIRow
+    from . import controlflow
+
+
+_REGISTERS = checked.constants(ix.Register)
+DWARF: dict[int, int] = {ix.Register.RAX: 0, ix.Register.RDX: 1, ix.Register.RCX: 2,
+                         ix.Register.RBX: 3, ix.Register.RSI: 4, ix.Register.RDI: 5,
+                         ix.Register.RBP: 6, ix.Register.RSP: 7,
+                         **{_REGISTERS[f'R{n}']: n for n in range(8, 16)}}
 CALLEE = frozenset((3, 6, 12, 13, 14, 15))
 WRITES = {ix.OpAccess.WRITE, ix.OpAccess.COND_WRITE,
           ix.OpAccess.READ_WRITE, ix.OpAccess.READ_COND_WRITE}
 BRANCHES = {ix.FlowControl.CONDITIONAL_BRANCH, ix.FlowControl.UNCONDITIONAL_BRANCH}
 NEAR = {ix.OpKind.NEAR_BRANCH16, ix.OpKind.NEAR_BRANCH32, ix.OpKind.NEAR_BRANCH64}
+# Indirect-call slots that receive whole-function dispatcher discovery.
+DISPATCHER_BUDGET = 256
 
 
 class Gap(ValueError):
     """Inference could not establish one unambiguous native frame."""
 
 
-def signed(value):
+def signed(value: int) -> int:
     return value - (1 << 64) if value & (1 << 63) else value
+
+
+# Typed reads of a CFI row ('pc' -> int, 'cfa' -> CFARule, DWARF register
+# number -> RegisterRule), shared with unwind.py. A missing 'pc'/'cfa' stays
+# a KeyError; a value of the wrong type is a ValueError.
+def row_pc(row: 'CFIRow') -> int:
+    value = row['pc']
+    if not isinstance(value, int):
+        raise ValueError('CFI row pc is not an integer')
+    return value
+
+
+def row_cfa(row: 'CFIRow') -> CFARule:
+    value = row['cfa']
+    if not isinstance(value, CFARule):
+        raise ValueError('CFI row cfa is not a CFARule')
+    return value
+
+
+def row_rule(row: 'CFIRow', reg: int) -> RegisterRule | None:
+    """The rule for DWARF register `reg`, or None when the row has none."""
+    value = row.get(reg)
+    if value is not None and not isinstance(value, RegisterRule):
+        raise ValueError(f'CFI row rule for DWARF register {reg} is not a RegisterRule')
+    return value
+
+
+class RowEvidence(TypedDict):
+    """Recovery.row's decision for one queried PC, as reported."""
+    original_pc: int
+    source: str
+    compiler_authored: bool
+    unknown_indirect_entries_excluded: bool
+    assumptions: list[str]
+    entry: NotRequired[int]
+    entry_sources: NotRequired[list[str]]
+    interval_end: NotRequired[int]
+    accepted: NotRequired[bool]  # always present once recorded
+    reachable_instructions: NotRequired[int]
+    cfa_register: NotRequired[int | None]
+    cfa_offset: NotRequired[int | None]
+    reason: NotRequired[str]
+
+
+class DispatcherEvidence(TypedDict):
+    """One indirect-call slot's dispatcher discovery, accepted or not."""
+    slot: int
+    call_sites: list[int]
+    source: str
+    accepted: bool
+    entry: NotRequired[int]
+    tail_targets: NotRequired[list[int]]
+    known_writers: NotRequired[list[int]]
+    reachable_instructions: NotRequired[int]
+    reason: NotRequired[str]
+
+
+class FrameReport(TypedDict):
+    accepted: int
+    rejected: int
+    reasons: dict[str, int]
+    entries: int
+    queries: list[RowEvidence]
+    indirect_dispatchers: list[DispatcherEvidence]
+    indirect_slot_budget: int
+    indirect_slot_count: int
+    compiler_authored: bool
+    unknown_indirect_entries_excluded: bool
 
 
 @dataclass(frozen=True)
 class State:
     # All offsets refer to entry RSP, whose return address occupies offset 0.
     sp: int = 0
-    values: tuple = tuple(r if r in CALLEE else None for r in range(16))
-    anchors: tuple = (None,) * 16
-    slots: tuple = ((0, 16),)
-    constants: tuple = (None,) * 16
+    # Per DWARF register 0-15: which incoming register's value it holds.
+    values: tuple[int | None, ...] = tuple(r if r in CALLEE else None for r in range(16))
+    # Per register: the entry-RSP offset it points to, when known.
+    anchors: tuple[int | None, ...] = (None,) * 16
+    # Sorted (offset, incoming register saved there) pairs.
+    slots: tuple[tuple[int, int], ...] = ((0, 16),)
+    # Per register: its possible constant values, when few and known.
+    constants: tuple[frozenset[int] | None, ...] = (None,) * 16
 
-    def join(self, other):
+    def join(self, other: 'State') -> 'State':
         if self.sp != other.sp:
             raise Gap('predecessors disagree about stack depth')
         values = tuple(a if a == b else None for a, b in zip(self.values, other.values))
@@ -59,12 +143,12 @@ class State:
                           for a, b in zip(self.constants, other.constants))
         return State(self.sp, values, anchors, slots, constants)
 
-    def row(self, pc):
+    def row(self, pc: int) -> 'CFIRow':
         if dict(self.slots).get(0) != 16:
             raise Gap('entry return address is no longer recoverable')
         cfa = (CFARule(6, 8 - self.anchors[6]) if self.anchors[6] is not None
                else CFARule(7, 8 - self.sp))
-        row = {'pc': pc, 'cfa': cfa, 16: RegisterRule('OFFSET', -8)}
+        row: 'CFIRow' = {'pc': pc, 'cfa': cfa, 16: RegisterRule('OFFSET', -8)}
         for register in CALLEE:
             if self.values[register] == register:
                 row[register] = RegisterRule('SAME_VALUE')
@@ -78,20 +162,22 @@ class State:
                 raise Gap(f'callee-saved DWARF register {register} has no recoverable incoming value')
         return row
 
-    def balanced(self):
+    def balanced(self) -> bool:
         return (self.sp == 0 and dict(self.slots).get(0) == 16
                 and all(self.values[r] == r for r in CALLEE))
 
 
-def step(state, ins, info):
+def step(state: State, ins: ix.Instruction, info: ix.InstructionInfo) -> State:
     """Transfer stack and saved-register facts; arithmetic remains opaque."""
     if ins.is_invalid or ins.is_privileged:
         raise Gap('invalid or privileged instruction in native function')
     values, anchors, slots = list(state.values), list(state.anchors), dict(state.slots)
     constants = list(state.constants)
     sp = state.sp
+    destination: int | None
 
-    def address(base, index=ix.Register.NONE, displacement=0):
+    def address(base: ix.Register_, index: ix.Register_ = ix.Register.NONE,
+                displacement: int = 0) -> int | None:
         reg = DWARF.get(base)
         full = DWARF.get(ix.RegisterExt.full_register(base))
         if reg is None and full is not None and (full == 7 or state.anchors[full] is not None):
@@ -101,7 +187,7 @@ def step(state, ins, info):
             raise Gap('indexed access to an inferred stack anchor')
         return None if anchor is None else anchor + signed(displacement)
 
-    def store(offset, size, value=None):
+    def store(offset: int, size: int, value: int | None = None) -> None:
         if not size:
             raise Gap('unknown-size write to an inferred stack anchor')
         for saved in list(slots):
@@ -162,8 +248,9 @@ def step(state, ins, info):
             amount = signed(ins.immediate(1))
             sp += amount if ins.mnemonic == ix.Mnemonic.ADD else -amount
         elif (ins.mnemonic == ix.Mnemonic.MOV and ins.op1_kind == ix.OpKind.REGISTER
-              and ins.op1_register in DWARF and state.anchors[DWARF[ins.op1_register]] is not None):
-            sp = state.anchors[DWARF[ins.op1_register]]
+              and ins.op1_register in DWARF
+              and (anchor := state.anchors[DWARF[ins.op1_register]]) is not None):
+            sp = anchor
         elif ins.mnemonic == ix.Mnemonic.LEA:
             new_sp = address(ins.memory_base, ins.memory_index, ins.memory_displacement)
             if new_sp is None:
@@ -213,9 +300,9 @@ def step(state, ins, info):
                     constants[destination] = frozenset((ins.immediate(1),))
                 elif ins.op1_kind == ix.OpKind.REGISTER:
                     source = DWARF.get(ix.RegisterExt.full_register(ins.op1_register))
-                    if source is not None and state.constants[source] is not None:
+                    if source is not None and (known := state.constants[source]) is not None:
                         mask = (1 << (width * 8)) - 1
-                        constants[destination] = frozenset(value & mask for value in state.constants[source])
+                        constants[destination] = frozenset(value & mask for value in known)
             elif ins.mnemonic == ix.Mnemonic.LEA and ins.is_ip_rel_memory_operand:
                 constants[destination] = frozenset((ins.ip_rel_memory_address & ((1 << (width * 8)) - 1),))
 
@@ -236,6 +323,10 @@ def step(state, ins, info):
     return State(sp, tuple(values), tuple(anchors), tuple(sorted(slots.items())), tuple(constants))
 
 
+# (sorted reachable PCs, per-PC index into the unique states, unique states)
+type Analysis = tuple[array[int], array[int], list[State]]
+
+
 class Recovery:
     """Feed once with the existing decoder, finish, then query inferred rows.
 
@@ -243,8 +334,22 @@ class Recovery:
     entries do not exist. Reports keep that distinction explicit. Successful
     analyses and gaps are cached, with a bounded LRU of compact per-PC states.
     """
-    def __init__(self, elf, recovery, *, max_instructions=8192, max_bytes=65536,
-                 max_cache=128):
+    entries: dict[int, set[str]]  # entry PC -> evidence sources
+    sizes: dict[int, int]
+    _starts: list[int]
+    _address_taken: list[int]
+    # register -> (loaded slot, instructions it stays pending)
+    _pending_loads: dict[ix.Register_, tuple[int, int]]
+    _last_ip: int | None
+    _slot_calls: dict[int, set[int]]
+    _slot_writers: dict[int, set[int]]
+    dispatchers: list[DispatcherEvidence]
+    _relocations: list[int]
+    cache: OrderedDict[int, Analysis | str]  # entry -> analysis or gap reason
+    decisions: dict[int, RowEvidence]
+
+    def __init__(self, elf: ELFFile, recovery: 'controlflow.Recovery', *, max_instructions: int = 8192,
+                 max_bytes: int = 65536, max_cache: int = 128) -> None:
         self.elf, self.decoded = elf, recovery
         self.max_instructions, self.max_bytes, self.max_cache = max_instructions, max_bytes, max_cache
         self.entries, self.sizes = {}, {}
@@ -271,7 +376,7 @@ class Recovery:
                             self.sizes[start] = min(self.sizes.get(start, 1 << 64), symbol['st_size'])
         self._relocations.sort()
 
-    def feed(self, ins):
+    def feed(self, ins: ix.Instruction) -> None:
         if self._finished:
             raise ValueError('native-frame scan already finished')
         if self._last_ip != ins.ip:
@@ -315,7 +420,7 @@ class Recovery:
             self._pending_loads.clear()
 
     @staticmethod
-    def _static_memory(ins):
+    def _static_memory(ins: ix.Instruction) -> int | None:
         if ins.segment_prefix in (ix.Register.FS, ix.Register.GS):
             return None
         if ins.is_ip_rel_memory_operand:
@@ -326,7 +431,7 @@ class Recovery:
             return ins.memory_displacement
         return None
 
-    def finish(self, *, address_taken=()):
+    def finish(self, *, address_taken: Iterable[int] = ()) -> None:
         if self._finished:
             return
         self.entries = {pc: sources for pc, sources in self.entries.items()
@@ -353,7 +458,7 @@ class Recovery:
         self._discover_dispatchers()
         self._finished = True
 
-    def _bounds(self, start):
+    def _bounds(self, start: int) -> int:
         index = bisect_right(self._starts, start)
         section_end = next((sec['sh_addr'] + sec['sh_size'] for sec in self.elf.iter_sections()
                             if sec['sh_flags'] & 4 and sec['sh_addr'] <= start < sec['sh_addr'] + sec['sh_size']), start)
@@ -361,7 +466,7 @@ class Recovery:
                    self._starts[index] if index < len(self._starts) else section_end,
                    start + self.sizes.get(start, self.max_bytes))
 
-    def _slot_initializer(self, slot):
+    def _slot_initializer(self, slot: int) -> int:
         # ET_DYN relocation semantics are deliberately outside this narrow
         # non-PIE dispatcher proof. Never infer a runtime value from a RELA
         # destination's unrelated pre-relocation bytes.
@@ -377,26 +482,27 @@ class Recovery:
                 return int.from_bytes(self.elf.stream.read(8), 'little')
         raise Gap('indirect-call slot has no file-backed initializer')
 
-    def _discover_dispatchers(self):
-        # At most 256 indirect slots receive whole-function discovery. Ordinary
-        # direct/symbol inference is unaffected when this optional budget fills.
+    def _discover_dispatchers(self) -> None:
+        # Ordinary direct/symbol inference is unaffected when the budget fills.
         attempts = 0
         for slot in sorted(self._slot_calls):
-            evidence = {'slot': slot, 'call_sites': sorted(self._slot_calls[slot]),
-                        'source': 'verified-indirect-call-slot', 'accepted': False}
+            evidence: DispatcherEvidence = {'slot': slot, 'call_sites': sorted(self._slot_calls[slot]),
+                                            'source': 'verified-indirect-call-slot', 'accepted': False}
+            start: int | None
+            previous: set[str] | None
             start, previous = None, None
             try:
                 start = self._slot_initializer(slot)
                 evidence['entry'] = start
                 if self.decoded.lookup(start) is None:
                     raise Gap('indirect-call initializer is not a verified code boundary')
-                if attempts >= 256:
+                if attempts >= DISPATCHER_BUDGET:
                     raise Gap('indirect-call dispatcher discovery budget exceeded')
                 attempts += 1
                 previous = self.entries.get(start)
                 self.entries[start] = set(previous or ()) | {'indirect-call-slot-initializer'}
                 self._starts = sorted(self.entries)
-                proof = {}
+                proof: dict[str, frozenset[int]] = {}
                 analysis = self._analyze(start, self._bounds(start), proof=proof)
                 addresses, ids, states = analysis
                 tails = proof['tail_targets']
@@ -404,7 +510,7 @@ class Recovery:
                     pos = bisect_left(addresses, pc)
                     if pos == len(addresses) or addresses[pos] != pc:
                         raise Gap('indirect-call slot is written outside its proven dispatcher')
-                    ins = self.decoded.lookup(pc)
+                    ins = checked.required(self.decoded.lookup(pc), 'decoded instruction of a proven dispatcher PC')
                     source = DWARF.get(ins.op1_register) if ins.op_count > 1 else None
                     constants = states[ids[pos]].constants[source] if source is not None else None
                     if (ins.mnemonic != ix.Mnemonic.MOV or ins.op0_kind != ix.OpKind.MEMORY
@@ -414,9 +520,9 @@ class Recovery:
                         raise Gap('indirect-call slot store has no verified ABI tail target')
                 for target in tails:
                     self.entries.setdefault(target, set()).add('verified-dispatch-tail')
-                evidence.update(accepted=True, tail_targets=sorted(tails),
-                                known_writers=sorted(self._slot_writers[slot]),
-                                reachable_instructions=len(addresses))
+                evidence.update({'accepted': True, 'tail_targets': sorted(tails),
+                                 'known_writers': sorted(self._slot_writers[slot]),
+                                 'reachable_instructions': len(addresses)})
             except Gap as error:
                 if start is not None and start in self.entries:
                     if previous is None:
@@ -427,7 +533,8 @@ class Recovery:
             self.dispatchers.append(evidence)
             self._starts = sorted(self.entries)
 
-    def _analyze(self, start, end, *, proof=None):
+    def _analyze(self, start: int, end: int, *,
+                 proof: dict[str, frozenset[int]] | None = None) -> Analysis:
         incoming, queue = {start: State()}, deque([start])
         visits, exits = 0, 0
         while queue:
@@ -466,7 +573,7 @@ class Recovery:
                         ix.FlowControl.EXCEPTION, ix.FlowControl.XBEGIN_XABORT_XEND):
                 raise Gap('unknown indirect, interrupt, or exceptional CFG edge')
             after = step(state, ins, self.factory.info(ins))
-            successors = []
+            successors: list[int] = []
             if flow in BRANCHES:
                 if ins.op0_kind not in NEAR:
                     raise Gap('non-near control transfer')
@@ -496,10 +603,14 @@ class Recovery:
         for pc, state in incoming.items():
             state.row(pc)
         if proof is not None:
+            lost = 'decoded instruction of an analyzed PC'
             proof['tail_targets'] = frozenset(target for pc, state in incoming.items()
-                if self.decoded.lookup(pc).flow_control == ix.FlowControl.INDIRECT_BRANCH
-                for target in state.constants[DWARF[self.decoded.lookup(pc).op0_register]])
+                if checked.required(self.decoded.lookup(pc), lost).flow_control == ix.FlowControl.INDIRECT_BRANCH
+                for target in checked.required(state.constants[DWARF[checked.required(self.decoded.lookup(pc), lost).op0_register]],
+                                       'constant target set of an accepted indirect tail'))
         addresses = array('Q', sorted(incoming))
+        unique: list[State]
+        numbers: dict[State, int]
         unique, ids, numbers = [], array('I'), {}
         for pc in addresses:
             state = incoming[pc]
@@ -509,21 +620,21 @@ class Recovery:
             ids.append(numbers[state])
         return addresses, ids, unique
 
-    def row(self, pc):
+    def row(self, pc: int) -> 'CFIRow':
         if not self._finished:
             raise ValueError('finish native-frame scan before querying rows')
-        evidence = {'original_pc': pc, 'source': 'inferred-native-cfg',
-                    'compiler_authored': False, 'unknown_indirect_entries_excluded': False,
-                    'assumptions': ['ordinary SysV CALL/return and callee-save convention',
-                                    'unrelated memory stores do not overwrite saved caller state',
-                                    'indirect-call slots are not modified through undiscovered aliases']}
+        evidence: RowEvidence = {'original_pc': pc, 'source': 'inferred-native-cfg',
+                                 'compiler_authored': False, 'unknown_indirect_entries_excluded': False,
+                                 'assumptions': ['ordinary SysV CALL/return and callee-save convention',
+                                                 'unrelated memory stores do not overwrite saved caller state',
+                                                 'indirect-call slots are not modified through undiscovered aliases']}
         try:
             index = bisect_right(self._starts, pc) - 1
             if index < 0:
                 raise Gap('no trusted symbol or decoded CALL entry precedes this PC')
             start = self._starts[index]
             end = self._bounds(start)
-            evidence.update(entry=start, entry_sources=sorted(self.entries[start]), interval_end=end)
+            evidence.update({'entry': start, 'entry_sources': sorted(self.entries[start]), 'interval_end': end})
             if not start <= pc < end:
                 raise Gap('PC is outside the bounded trusted-entry interval')
             if start not in self.cache:
@@ -542,24 +653,24 @@ class Recovery:
             if position == len(addresses) or addresses[position] != pc:
                 raise Gap('PC is not reachable from its trusted entry')
             row = states[ids[position]].row(pc)
-            evidence.update(accepted=True, reachable_instructions=len(addresses),
-                            cfa_register=row['cfa'].reg, cfa_offset=row['cfa'].offset)
+            evidence.update({'accepted': True, 'reachable_instructions': len(addresses),
+                             'cfa_register': row_cfa(row).reg, 'cfa_offset': row_cfa(row).offset})
             self.decisions[pc] = evidence
             return row
         except Gap as error:
             self.decisions[pc] = {**evidence, 'accepted': False, 'reason': str(error)}
             raise
 
-    def evidence(self, pc):
+    def evidence(self, pc: int) -> RowEvidence | None:
         return self.decisions.get(pc)
 
-    def report(self):
+    def report(self) -> FrameReport:
         values = list(self.decisions.values())
         return {'accepted': sum(item['accepted'] for item in values),
                 'rejected': sum(not item['accepted'] for item in values),
                 'reasons': dict(Counter(item['reason'] for item in values if not item['accepted'])),
                 'entries': len(self.entries), 'queries': values,
                 'indirect_dispatchers': self.dispatchers,
-                'indirect_slot_budget': 256,
+                'indirect_slot_budget': DISPATCHER_BUDGET,
                 'indirect_slot_count': len(self._slot_calls),
                 'compiler_authored': False, 'unknown_indirect_entries_excluded': False}

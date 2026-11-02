@@ -31,7 +31,7 @@ LENGTHS = (-(1 << 63), -(1 << 32), -(1 << 31), -17, -16, -9, -8,
            -1, 0, 1, 7, 8, 9, 15, 16, 17, 1 << 31, 1 << 32, (1 << 63) - 1)
 
 
-def machine(form, imm, shape="ordinary"):
+def machine(form: int, imm: int, shape: str = "ordinary") -> bytes:
     """Six length/output forms, with five source/destination shapes."""
     opcode = (0x63, 0x62, 0x61, 0x60, 0x61, 0x60)[form]
     dest, src = {"ordinary": (0, 1), "high": (13, 15),
@@ -51,7 +51,7 @@ def machine(form, imm, shape="ordinary"):
     return bytes(code + [imm])
 
 
-def generate(directory, core):
+def generate(directory: Path, core: Path) -> Path:
     # Deferred so a hardware worker has no third-party Python dependency.
     from iced_x86 import Decoder
     from static_penryn.strings import build_helpers, lower
@@ -107,15 +107,15 @@ def generate(directory, core):
     assembly = directory / "checks.s"
     assembly.write_text("\n".join(lines) + "\n")
     helper, report = build_helpers(instructions, core, directory)
-    print(f"Specialized helpers: {len(report["specializations"])}, "
-          f"maximum stack: {report["max_stack_bytes"]} bytes", flush=True)
+    print(f"Specialized helpers: {len(report['specializations'])}, "
+          f"maximum stack: {report['max_stack_bytes']} bytes", flush=True)
     library = directory / "checks.so"
     subprocess.run(["cc", "-shared", "-nostdlib", "-Wl,--gc-sections,--no-undefined",
                     str(assembly), str(helper), "-o", str(library)], check=True)
     return library
 
 
-def run(library, iterations):
+def run(library: Path, iterations: int) -> None:
     flags = Path("/proc/cpuinfo").read_text().split("flags", 1)[1].split("\n", 1)[0]
     if "sse4_2" not in flags.split():
         raise SystemExit("Hardware oracle requires native SSE4.2; refusing an opemu-only CPU")
@@ -124,7 +124,7 @@ def run(library, iterations):
     count = 0
     for form in range(6):
         for imm in range(256):
-            funcs = [getattr(lib, f"{kind}_{form}_{imm}") for kind in ("native", "static")]
+            funcs = [lib[f"{kind}_{form}_{imm}"] for kind in ("native", "static")]
             for func in funcs:
                 func.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64,
                                  ctypes.c_int64, ctypes.c_void_p]
@@ -148,7 +148,7 @@ def run(library, iterations):
     for form in range(6):
         for imm in CONTROLS:
             for shape in ("high", "alias", "memory", "stack", "scratch_alias", "scratch_memory"):
-                funcs = [getattr(lib, f"state_{kind}_{form}_{imm}_{shape}") for kind in ("native", "static")]
+                funcs = [lib[f"state_{kind}_{form}_{imm}_{shape}"] for kind in ("native", "static")]
                 for func in funcs:
                     func.argtypes = [ctypes.c_void_p]
                     func.restype = None
@@ -160,26 +160,33 @@ def run(library, iterations):
                     memory.raw = rng.randbytes(32)
                     initial[32:40] = ctypes.addressof(memory).to_bytes(8, "little")  # RSI
                     initial[FLAGS:FLAGS + 8] = (0x602 | (rng.randrange(4096) & 0x8d5)).to_bytes(8, "little")
-                    observed = []
+                    snapshots = []
                     for func in funcs:
                         state = ctypes.create_string_buffer(bytes(initial), STATE_SIZE)
                         func(state)
-                        observed.append(bytes(state))
-                    if observed[0] != observed[1]:
-                        diff = [i for i in range(STATE_SIZE) if observed[0][i] != observed[1][i]]
+                        snapshots.append(bytes(state))
+                    if snapshots[0] != snapshots[1]:
+                        diff = [i for i in range(STATE_SIZE) if snapshots[0][i] != snapshots[1][i]]
                         raise AssertionError(("state", form, imm, shape, case, diff))
                     count += 1
     print(f"PCMPxSTRx full GPR/XMM/flags/red-zone comparisons: {count}", flush=True)
 
 
-def main():
+class Arguments(argparse.Namespace):
+    remote: str | None
+    core: Path | None
+    iterations: int
+    run: Path | None
+
+
+def main() -> None:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote", help="native SSE4.2 SSH host, e.g. lix-ory")
     parser.add_argument("--core", type=Path, help="opemu-linux/core checkout directory")
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--run", type=Path, help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    args = parser.parse_args(namespace=Arguments())
     if args.iterations < 1:
         parser.error("--iterations must be positive")
     if args.run:

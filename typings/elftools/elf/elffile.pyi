@@ -1,0 +1,43 @@
+# Typed surface of pyelftools 0.32, the Nix environment's version, that
+# static-penryn uses (requirements.txt's 0.33 for a venv is not separately
+# checked against these stubs). pyelftools marks
+# itself py.typed but leaves these APIs unannotated, so their values would
+# otherwise be Any. Enumerated header fields are strings for known values and
+# the raw integer otherwise.
+from collections.abc import Iterator, Mapping
+from typing import Literal, Protocol, overload
+
+from elftools.dwarf.dwarfinfo import DWARFInfo
+from elftools.elf.sections import Section
+from elftools.elf.segments import Segment
+
+class ELFStream(Protocol):
+    def seek(self, pos: int, whence: int = ..., /) -> object: ...
+    def read(self, size: int = ..., /) -> bytes: ...
+    def tell(self) -> int: ...
+
+_HeaderInt = Literal[
+    'e_entry', 'e_phoff', 'e_shoff', 'e_flags', 'e_ehsize', 'e_phentsize',
+    'e_phnum', 'e_shentsize', 'e_shnum', 'e_shstrndx',
+]
+_HeaderEnum = Literal['e_type', 'e_machine', 'e_version']
+
+class ELFFile:
+    stream: ELFStream
+    elfclass: int
+    little_endian: bool
+    header: Mapping[str, object]
+    def __init__(self, stream: ELFStream, stream_loader: None = None) -> None: ...
+    @overload
+    def __getitem__(self, name: _HeaderInt) -> int: ...
+    @overload
+    def __getitem__(self, name: _HeaderEnum) -> str | int: ...
+    def get_section(self, n: int) -> Section: ...
+    def get_section_by_name(self, name: str) -> Section | None: ...
+    def get_section_index(self, section_name: str) -> int | None: ...
+    def iter_sections(self, type: str | None = None) -> Iterator[Section]: ...
+    def iter_segments(self, type: str | None = None) -> Iterator[Segment]: ...
+    def get_dwarf_info(
+        self, relocate_dwarf_sections: bool = True, follow_links: bool = True
+    ) -> DWARFInfo: ...
+    def close(self) -> None: ...

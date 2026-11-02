@@ -9,10 +9,14 @@ separately by unwind.py. MAX_STACK_BYTES includes the protected red zone.
 
 RIP memory loads deliberately use an explicit PC-relative relocation: GAS
 silently treats an already-defined absolute .set symbol as a displacement.
-The relocation remains correct when the containing ELF is loaded with a bias.
+LLVM's assembler, which assembles this text now, takes the same .reloc and
+gave identical bytes. The relocation remains correct when the containing ELF
+is loaded with a bias.
 """
 
 import iced_x86 as ix
+
+from .checked import constants
 
 
 MAX_STACK_BYTES = 176
@@ -23,7 +27,8 @@ _REGS = [ix.Register.RAX, ix.Register.RCX, ix.Register.RDX,
          ix.Register.R8, ix.Register.R9, ix.Register.R10, ix.Register.R11,
          ix.Register.R12, ix.Register.R13, ix.Register.R14, ix.Register.R15,
          ix.Register.RBP]
-_WIDTH_NAMES = {
+_REGISTERS = constants(ix.Register)
+_WIDTH_NAMES: dict[int, tuple[str, str, str, str]] = {
     ix.Register.RAX: ("al", "ax", "eax", "rax"),
     ix.Register.RCX: ("cl", "cx", "ecx", "rcx"),
     ix.Register.RDX: ("dl", "dx", "edx", "rdx"),
@@ -32,7 +37,7 @@ _WIDTH_NAMES = {
     ix.Register.RBP: ("bpl", "bp", "ebp", "rbp"),
     ix.Register.RSI: ("sil", "si", "esi", "rsi"),
     ix.Register.RDI: ("dil", "di", "edi", "rdi"),
-    **{getattr(ix.Register, f"R{n}"): (f"r{n}b", f"r{n}w", f"r{n}d", f"r{n}")
+    **{_REGISTERS[f"R{n}"]: (f"r{n}b", f"r{n}w", f"r{n}d", f"r{n}")
        for n in range(8, 16)},
 }
 _MEM_SIZES = {1: "BYTE", 2: "WORD", 4: "DWORD", 8: "QWORD", 16: "XMMWORD"}
@@ -42,27 +47,31 @@ class LoweringError(ValueError):
     """A form that cannot be lowered with the implemented guarantees."""
 
 
-def reg_name(register):
+def reg_name(register: int) -> str:
+    # iced's Register type is a plain int at runtime (ix.Register_ is int).
+    if not isinstance(register, ix.Register_):
+        raise TypeError(f"argument 'register': '{type(register).__name__}' object "
+                        "cannot be interpreted as an integer")
     return _FORMATTER.format_register(register).lower()
 
 
-def _reg(register, size=8):
+def _reg(register: ix.Register_, size: int = 8) -> str:
     return _WIDTH_NAMES[ix.RegisterExt.full_register(register)][{1: 0, 2: 1, 4: 2, 8: 3}[size]]
 
 
-def _signed(value, bits):
+def _signed(value: int, bits: int) -> int:
     value &= (1 << bits) - 1
     return value - (1 << bits) if value >= (1 << (bits - 1)) else value
 
 
-def _address_size(ins):
+def _address_size(ins: ix.Instruction) -> ix.CodeSize_:
     memories = ix.InstructionInfoFactory().info(ins).used_memory()
     if not memories:
         raise LoweringError("instruction has no memory operand")
     return memories[0].address_size
 
 
-def memory_operand(ins, operand_index=1, stack_delta=0):
+def memory_operand(ins: ix.Instruction, operand_index: int = 1, stack_delta: int = 0) -> str:
     """Render a memory operand; use memory_load() to include RIP relocation.
 
     stack_delta is original RSP minus current RSP.  Other address registers
@@ -102,7 +111,8 @@ def memory_operand(ins, operand_index=1, stack_delta=0):
     return f"{_MEM_SIZES[size]} PTR {segment}[{' + '.join(parts)}]"
 
 
-def memory_load(ins, destination, stack_delta=0, mnemonic="mov", operand_index=1):
+def memory_load(ins: ix.Instruction, destination: str, stack_delta: int = 0,
+                mnemonic: str = "mov", operand_index: int = 1) -> str:
     """A complete GAS load, including any RIP relocation and addr32 prefix."""
     operand = memory_operand(ins, operand_index, stack_delta)
     prefix = "addr32 " if _address_size(ins) == ix.CodeSize.CODE32 else ""
@@ -112,7 +122,7 @@ def memory_load(ins, destination, stack_delta=0, mnemonic="mov", operand_index=1
     return result
 
 
-def _source_size(ins):
+def _source_size(ins: ix.Instruction) -> int:
     if ins.op1_kind == ix.OpKind.REGISTER:
         return ix.RegisterExt.size(ins.op1_register)
     if ins.op1_kind == ix.OpKind.MEMORY:
@@ -120,7 +130,7 @@ def _source_size(ins):
     raise LoweringError("unsupported source operand")
 
 
-def _source_load(ins, scratch, stack_delta):
+def _source_load(ins: ix.Instruction, scratch: ix.Register_, stack_delta: int) -> list[str]:
     size = _source_size(ins)
     if size not in (1, 2, 4, 8):
         raise LoweringError(f"unsupported scalar source width {size}")
@@ -139,30 +149,34 @@ def _source_load(ins, scratch, stack_delta):
     return [f"{opcode} {target}, {reg_name(source)}"]
 
 
-def _prologue(scratch, preserve_flags):
+def _prologue(scratch: list[ix.Register_], preserve_flags: bool) -> list[str]:
     if not scratch and not preserve_flags:
         return []
     return (["lea rsp, [rsp - 128]"] + (["pushfq"] if preserve_flags else [])
             + [f"push {_reg(r)}" for r in scratch])
 
 
-def _epilogue(scratch, preserve_flags):
+def _epilogue(scratch: list[ix.Register_], preserve_flags: bool) -> list[str]:
     if not scratch and not preserve_flags:
         return []
     return ([f"pop {_reg(r)}" for r in reversed(scratch)]
             + (["popfq"] if preserve_flags else []) + ["lea rsp, [rsp + 128]"])
 
 
-def _scalar_scratch(ins, count, dead_registers):
+def _scalar_scratch(ins: ix.Instruction, count: int,
+                    dead_registers: frozenset[int]) -> list[ix.Register_]:
     if ins.op0_kind != ix.OpKind.REGISTER or not ix.RegisterExt.is_gpr(ins.op0_register):
         raise LoweringError("expected a general-purpose destination register")
     destination = ix.RegisterExt.full_register(ins.op0_register)
     if destination == ix.Register.RSP:
         raise LoweringError("RSP/ESP/SP destinations require a different trampoline")
+
+    def live(r: ix.Register_) -> bool:
+        return r not in dead_registers
     # Native frame-pointer walkers observe RBP even when normal-execution
     # dataflow proves its old value dead. It is never an implicit temporary.
     candidates = sorted((r for r in _REGS if r not in (destination, ix.Register.RBP)),
-                        key=lambda r: r not in dead_registers)
+                        key=live)
     # MOVZX r32, AH/CH/DH/BH cannot carry REX. The first temporary receives
     # the source before any other register changes; this also handles aliases
     # with the destination and memory base/index without special cases.
@@ -174,13 +188,14 @@ def _scalar_scratch(ins, count, dead_registers):
     return candidates[:count]
 
 
-def _frame(scratch, preserve_flags, dead_registers):
+def _frame(scratch: list[ix.Register_], preserve_flags: bool,
+           dead_registers: frozenset[int]) -> tuple[list[ix.Register_], int]:
     saved = [r for r in scratch if r not in dead_registers]
     delta = 128 + len(saved) * 8 + 8 * preserve_flags if saved or preserve_flags else 0
     return saved, delta
 
 
-def _popcnt(ins, preserve_flags, dead_registers):
+def _popcnt(ins: ix.Instruction, preserve_flags: bool, dead_registers: frozenset[int]) -> list[str]:
     size = ix.RegisterExt.size(ins.op0_register)
     if size not in (2, 4, 8) or _source_size(ins) != size:
         raise LoweringError("unsupported POPCNT form")
@@ -228,7 +243,7 @@ def _popcnt(ins, preserve_flags, dead_registers):
     return lines + _epilogue(saved, False)
 
 
-def _crc32(ins, preserve_flags, dead_registers):
+def _crc32(ins: ix.Instruction, preserve_flags: bool, dead_registers: frozenset[int]) -> list[str]:
     destination_size = ix.RegisterExt.size(ins.op0_register)
     source_size = _source_size(ins)
     if destination_size not in (4, 8) or source_size not in (1, 2, 4, 8):
@@ -280,7 +295,7 @@ def _crc32(ins, preserve_flags, dead_registers):
     return lines + _epilogue(saved, False)
 
 
-def _pcmpgtq(ins, preserve_flags, dead_registers, dead_xmms=frozenset()):
+def _pcmpgtq(ins: ix.Instruction, dead_xmms: frozenset[int]) -> list[str]:
     if ins.op0_kind != ix.OpKind.REGISTER or not ix.RegisterExt.is_xmm(ins.op0_register):
         raise LoweringError("expected an XMM destination")
     if _source_size(ins) != 16:
@@ -290,8 +305,11 @@ def _pcmpgtq(ins, preserve_flags, dead_registers, dead_xmms=frozenset()):
         return [f"pxor {destination}, {destination}"]
     excluded = {ins.op0_register, ins.op1_register}
     count = 3 if ins.op1_kind == ix.OpKind.MEMORY else 2
+
+    def live(r: int) -> bool:
+        return r not in dead_xmms
     candidates = sorted((r for r in range(ix.Register.XMM0, ix.Register.XMM15 + 1)
-                         if r not in excluded), key=lambda r: r not in dead_xmms)
+                         if r not in excluded), key=live)
     scratch_regs = candidates[:count]
     scratch = [reg_name(r) for r in scratch_regs]
     saved = [reg_name(r) for r in scratch_regs if r not in dead_xmms]
@@ -316,10 +334,10 @@ def _pcmpgtq(ins, preserve_flags, dead_registers, dead_xmms=frozenset()):
     return lines + ([f"lea rsp, [rsp + {stack_delta}]"] if stack_delta else [])
 
 
-def support_assembly():
+def support_assembly() -> str:
     """Shared read-only constants, position independent and Penryn compatible."""
-    tables = []
-    table = []
+    tables: list[list[int]] = []
+    table: list[int] = []
     for byte in range(256):
         value = byte
         for _ in range(8):
@@ -333,13 +351,15 @@ def support_assembly():
         lines.extend('.long ' + ', '.join(f'0x{v:08x}' for v in table[i:i + 8])
                      for i in range(0, 256, 8))
     lines += ['.section .rodata.penryn.popcnt,"a",@progbits', '.balign 64']
-    for label, value in (("55", "5555555555555555"), ("33", "3333333333333333"),
-                         ("0f", "0f0f0f0f0f0f0f0f"), ("01", "0101010101010101")):
-        lines += [f'.Lpenryn_pop{label}:', f'.quad 0x{value}']
+    for label, digits in (("55", "5555555555555555"), ("33", "3333333333333333"),
+                          ("0f", "0f0f0f0f0f0f0f0f"), ("01", "0101010101010101")):
+        lines += [f'.Lpenryn_pop{label}:', f'.quad 0x{digits}']
     return "\n".join(lines) + "\n"
 
 
-def lower(ins, *, preserve_flags=True, dead_registers=frozenset(), dead_xmms=frozenset()):
+def lower(ins: ix.Instruction, *, preserve_flags: bool = True,
+          dead_registers: frozenset[int] = frozenset(),
+          dead_xmms: frozenset[int] = frozenset()) -> str:
     """Return leaf Intel-syntax GAS, excluding header and continuation jump.
 
     Defaults preserve every non-output register and architecturally specified
@@ -349,16 +369,16 @@ def lower(ins, *, preserve_flags=True, dead_registers=frozenset(), dead_xmms=fro
     """
     if ins.has_lock_prefix:
         raise LoweringError("LOCK-prefixed instruction cannot be lowered")
-    if not isinstance(preserve_flags, bool):
-        raise LoweringError("preserve_flags must be boolean")
     if any(r not in _WIDTH_NAMES or r == ix.Register.RSP for r in dead_registers):
         raise LoweringError("dead_registers must contain full non-stack GPRs")
     if any(not ix.Register.XMM0 <= r <= ix.Register.XMM15 for r in dead_xmms):
         raise LoweringError("dead_xmms must contain legacy XMM0..XMM15 registers")
-    implementation = {ix.Mnemonic.POPCNT: _popcnt, ix.Mnemonic.CRC32: _crc32,
-                      ix.Mnemonic.PCMPGTQ: _pcmpgtq}.get(ins.mnemonic)
-    if implementation is None:
+    if ins.mnemonic == ix.Mnemonic.POPCNT:
+        lines = _popcnt(ins, preserve_flags, dead_registers)
+    elif ins.mnemonic == ix.Mnemonic.CRC32:
+        lines = _crc32(ins, preserve_flags, dead_registers)
+    elif ins.mnemonic == ix.Mnemonic.PCMPGTQ:
+        lines = _pcmpgtq(ins, dead_xmms)
+    else:
         raise LoweringError(f"unsupported instruction: {_FORMATTER.format(ins)}")
-    if ins.mnemonic == ix.Mnemonic.PCMPGTQ:
-        return "\n".join(_pcmpgtq(ins, preserve_flags, dead_registers, dead_xmms)) + "\n"
-    return "\n".join(implementation(ins, preserve_flags, dead_registers)) + "\n"
+    return "\n".join(lines) + "\n"
