@@ -177,14 +177,19 @@ patched both installed payloads; both originals die of SIGILL there.
   - 1,355 sites; the 52 Go sites have no runtime metadata, and 56 ranges
     lack unwind rows.
 
-**2026-11-02, installed on iMacGBC (generation 486).** The installed
-payloads are the two outputs above. opemu's counters are global, so each
-run was measured against an idle window of the same length.
-- Emulated instructions per `--version` fell to the idle level: from about
-  520 for Claude, and from 91,000–114,000 for agy.
-- `agy --hub`, run with the IDE's environment, served its port within a
-  second and stayed up. No trap site sampled over 20 s lay in its
-  mappings.
+**2026-11-02, installed on iMacGBC (generation 486, boot `527a5808`).**
+The installed payloads are the two outputs above. On silicon, after the
+reboot, opemu's global counters read exactly:
+- 0 emulated instructions over an idle minute of a Claude Code session
+  running on the rewritten binary. The unrewritten one had kept opemu at
+  1,600–2,000 a second.
+- 0 per `claude --version` (about 520 before) and 0 per `agy --version`
+  (91,000–114,000 before).
+- 0 in 30 s of `agy --hub` with the IDE's environment, the Antigravity
+  IDE's agent, which served HTTP 200.
+
+The boot's only emulated instructions were two POPCNTs in pyright's
+language server, outside this tool's inputs.
 
 ## Development
 
