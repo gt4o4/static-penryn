@@ -10,11 +10,14 @@ core of `gt4o4/opemu-linux`: `CORE_HASHES` pins its two files, validated at
 **Packaged by nix-configs since 2026-11-02** as `pkgs.custom.static-penryn`
 (`common/pkgs/static-penryn.nix`, pinned by rev).
 - `hosts/iMacGBC/penryn-overlays.nix` rewrites Claude Code and agy with it
-  at build time, with the options validated below.
-- It checks both on a QEMU Penryn model with no emulator, and keeps each
-  report under `share/static-penryn/`.
-- iMacGBC has run the rewritten binaries since generation 486
-  (2026-11-02).
+  at build time, with the options validated below, and antigravity-hub's
+  `language_server` and `webm_encoder` with agy's.
+- It checks Claude and agy on a QEMU Penryn model with no emulator, and
+  keeps each report under `share/static-penryn/`. The hub's
+  `language_server` hashes strings with compiled-in AES-NI, which this tool
+  does not rewrite, so its check keeps an emulator.
+- iMacGBC has run the rewritten Claude and agy since generation 486, and
+  the hub's binaries since 488 (both 2026-11-02).
 - Everything else still runs on opemu, so don't retire it, and don't combine
   this with CPUID spoofing.
 
@@ -107,7 +110,11 @@ env -u LD_PRELOAD qemu-x86_64 -cpu Penryn OUTPUT --version
   stack-growth check.
 - Fault PCs, signal contexts and C++ landing pads are not remapped. JIT code
   and shared libraries are not rewritten. AVX, AES-NI, PCLMULQDQ and BMI
-  stay behind the program's own CPU dispatch.
+  are left as they are: behind the program's own CPU dispatch, or, compiled
+  in, to opemu.
+- Rewrite last. A later `patchelf` or `strip` that rewrites program headers
+  breaks the output: antigravity-hub's autoPatchelf did, and the binary
+  died of SIGSEGV.
 - Replacing an installed package or retiring opemu needs sustained real
   workloads and complete runtime metadata first.
 
@@ -196,6 +203,22 @@ reboot, opemu's global counters read exactly:
 
 The boot's only emulated instructions were two POPCNTs in pyright's
 language server, outside this tool's inputs.
+
+**2026-11-02, antigravity-hub 2.28.2 (generation 488, `3a106be`).** Both
+binaries were rewritten with `--allow-relocate --unwind` after their gate
+patch: `language_server` has 1,414 sites (1,262 CRC32, 117 POPCNT, 33
+PCMPGTQ, 2 PCMPESTRI) and `webm_encoder` 38. Exact opemu counts on
+silicon, before → after:
+- `language_server --stamp`: 85,407 POPCNT, 1,558 CRC32, 310 PCMPGTQ and
+  758 AES → 758 AES. `--help` gave the same.
+- 30 s of the hub's own invocation: 162,296 POPCNT, 1,558 CRC32, 310
+  PCMPGTQ and 758 AES → 758 AES.
+- `webm_encoder --help`: 158 POPCNT → 0.
+
+The AES is an AESENC/AESDEC string hash compiled in with `-maes` (1,344
+instructions), so on QEMU Penryn without an emulator the rewritten server
+still dies of SIGILL. Claude Code's and agy's payloads are unchanged by
+`3a106be` (`a2ffdb40…`, `3f549ea2…`).
 
 ## Development
 
