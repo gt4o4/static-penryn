@@ -140,18 +140,23 @@ def validate_elf(data: bytes | bytearray, elf: ELFFile) -> ElfMetadata:
     # Static ET_EXEC function-pointer arrays lose their relocations at link
     # time; stripping symbols must not make their targets stealable. Restrict
     # discovery to aligned words in allocated, non-code, file-backed sections.
-    for sec in sections:
-        if (sec['sh_flags'] & 2 and not sec['sh_flags'] & (4 | 0x800)
-                and sec['sh_type'] in ('SHT_PROGBITS', 'SHT_INIT_ARRAY',
-                                       'SHT_FINI_ARRAY', 'SHT_PREINIT_ARRAY')):
-            begin = sec['sh_offset'] + (-sec['sh_addr'] % 8)
-            end = sec['sh_offset'] + sec['sh_size']
-            if begin >= end:
-                continue
-            end -= (end - begin) % 8
-            for (value,) in iter_ints('<Q', memoryview(data)[begin:end]):
-                if low <= value < high:
-                    add_target(value)
+    # An ET_DYN image's code pointers all carry relocations, which the dynamic
+    # tables below add; an unrelocated word there is a number that may fall in
+    # the code range by chance (antigravity-hub 2.28.2's language_server keeps
+    # 32-bit hashes beside relocated pointers in .data.rel.ro).
+    if elf['e_type'] == 'ET_EXEC':
+        for sec in sections:
+            if (sec['sh_flags'] & 2 and not sec['sh_flags'] & (4 | 0x800)
+                    and sec['sh_type'] in ('SHT_PROGBITS', 'SHT_INIT_ARRAY',
+                                           'SHT_FINI_ARRAY', 'SHT_PREINIT_ARRAY')):
+                begin = sec['sh_offset'] + (-sec['sh_addr'] % 8)
+                end = sec['sh_offset'] + sec['sh_size']
+                if begin >= end:
+                    continue
+                end -= (end - begin) % 8
+                for (value,) in iter_ints('<Q', memoryview(data)[begin:end]):
+                    if low <= value < high:
+                        add_target(value)
 
     relocation_ranges: set[tuple[int, int]] = set()
     dynamic = [s for s in segments if s['p_type'] == 'PT_DYNAMIC']

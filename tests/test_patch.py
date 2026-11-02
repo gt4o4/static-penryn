@@ -431,6 +431,19 @@ class PatchTests(unittest.TestCase):
         result = self.invoke(binary, '--allow-relocate', success=False)
         self.assertIn('entry point', result.stderr)
 
+    def test_unrelocated_pie_word_is_not_a_pointer(self) -> None:
+        # A PIE's code pointers carry relocations; an unrelocated data word
+        # that happens to equal a code address is a number, not an entry.
+        binary = self.fixture('popcnt eax,ebx\n.Lentry:\nmov edi,eax', pie=True,
+                              extra='\n.data\n.p2align 3\n.quad 0\n')
+        elf = self.elf(binary)
+        text, data = elf.get_section_by_name('.text'), elf.get_section_by_name('.data')
+        assert text is not None and data is not None
+        entry = text['sh_addr'] + 4
+        self.mutate(binary, '<Q', data['sh_offset'], entry)
+        self.assertNotIn(entry, self.check_elf(binary)['pointer_targets'])
+        self.penryn(self.invoke(binary, '--allow-relocate'))
+
     def test_exec_load_gaps_reported_without_decoding_data(self) -> None:
         binary = self.fixture('popcnt rax,rbx', link_extra=('-Wl,-z,noseparate-code',))
         metadata = self.check_elf(binary)
