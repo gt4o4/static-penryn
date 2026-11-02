@@ -14,7 +14,7 @@ authors = [{ name = "Bingchen Gong" }]
 requires-python = ">=3.12"
 dependencies = [
     "iced-x86>=1.21,<2",
-    "pyelftools>=0.33",
+    "pyelftools>=0.32",
     "pwntools>=4.15,<5",
     # The assembler's setjmp/longjmp shim is verified per llvmlite release
     # (AGENTS.md, Invariants).
