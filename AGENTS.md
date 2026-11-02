@@ -59,7 +59,9 @@ export PENRYN_LIBTCC=$(nix build --impure --no-link --print-out-paths --max-jobs
   not audited").
 - `PENRYN_GLIB_CFLAGS` replaces `pkg-config --cflags glib-2.0` for the
   profiler's plugin.
-- The wrapper sets all three.
+- `PENRYN_CORE` names opemu-linux's `core/` (`--core` overrides it; a
+  checkout defaults to `../opemu-linux/core`).
+- The wrapper sets all four.
 
 Tests run one module per command. They need `cc`, `gcc`, `ld` and
 `qemu-x86_64`. Fixtures run under `qemu-x86_64 -cpu Penryn`, where the
@@ -156,6 +158,11 @@ binds a profile to its `output_sha256` and exact stub ranges, and
 - **The package is `static_penryn/`.** nix-configs' recipe packages exactly
   that directory minus `__pycache__`, so anything placed there ships, and at
   the next pin bump it changes iMacGBC's Claude Code and agy.
+  - `pyproject.toml` makes it a Python package with the `static-penryn`
+    command (`static_penryn.cli`, also `python -m static_penryn`).
+  - Its package-data patterns must cover every non-Python file the code
+    opens beside itself.
+  - Its version is set by hand, there and in nix-configs' recipe.
 - **Correct output is the criterion, not byte equality with GNU tools.**
   Check equivalence by decoded content (`tests.structdiff`).
 - **The assembler shim is undefined behaviour by the C standard**, the

@@ -109,8 +109,9 @@ FAMILIES = {_MNEMONICS[name]: name for name in (
     'POPCNT', 'CRC32', 'PCMPGTQ', 'PCMPISTRI', 'PCMPISTRM',
     'PCMPESTRI', 'PCMPESTRM', 'PCMPESTRI64', 'PCMPESTRM64')}
 HERE = Path(__file__).resolve().parent
-# The pinned opemu-linux checkout beside this one (nix-configs' submodules/).
-OPEMU_CORE = HERE.parents[1] / 'opemu-linux/core'
+# PENRYN_CORE names opemu-linux's core/; a checkout's default is the opemu
+# checkout beside it (nix-configs' submodules/).
+OPEMU_CORE = Path(os.environ.get('PENRYN_CORE') or HERE.parents[1] / 'opemu-linux/core')
 CORE_HASHES = {
     'emu-core.c': '37afd5483069ddd7d746da5b247b425b7fad7b0b7f23c1335fd68097478de475',
     'emu-core.h': '805c42a74ada75b48c00e1d134b4b938647c25ecd718fd18df4205c8d30cc9cd',

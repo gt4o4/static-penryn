@@ -56,12 +56,18 @@ nix build --impure --expr '
 The wrapper supplies GCC/binutils, the Python dependencies, QEMU, perf, the
 pinned opemu core and `PENRYN_GOMETA`, `PENRYN_LIBTCC` and
 `PENRYN_GLIB_CFLAGS`; `static-penryn profile|workloads|bench …` run the
-profiling tools. Without Nix, on a host whose `python3`, `cc` and `ld` are
-x86-64 (lix-ory, not iMacGBC): a venv with `requirements.txt`, TinyCC's
-x86-64 `libtcc.so` as `PENRYN_LIBTCC` (AGENTS.md builds the package's), the
-Go helper as `PENRYN_GOMETA` (`go build -o /tmp/penryn-go-metadata
-./static_penryn/go_metadata.go`) and the opemu checkout at `../opemu-linux`
-(`--core` overrides it).
+profiling tools.
+
+Without Nix, use a host whose `python3`, `cc` and `ld` are x86-64 (lix-ory,
+not iMacGBC). Install the `static-penryn` command with
+`pip install git+https://github.com/gt4o4/static-penryn` (Python 3.12+;
+`-c requirements.txt` pins the tested versions). It then needs:
+- TinyCC's x86-64 `libtcc.so` as `PENRYN_LIBTCC` (AGENTS.md builds the
+  package's);
+- the Go helper as `PENRYN_GOMETA`, built with `go build -o
+  /tmp/penryn-go-metadata` from the package's `go_metadata.go`;
+- opemu-linux's `core/` as `PENRYN_CORE` or `--core` (a checkout defaults to
+  `../opemu-linux/core`).
 
 ## Run
 
@@ -195,3 +201,9 @@ language server, outside this tool's inputs.
 
 [AGENTS.md](AGENTS.md) has the commands, tests, architecture, invariants,
 runtime contracts and library decisions.
+
+## License
+
+GPL-2.0-or-later ([LICENSE](LICENSE)), as QEMU's `qemu-plugin.h`, which the
+profiler plugin includes, requires. The string helpers compile at run time
+from opemu-linux's MIT core, which is not part of this package.

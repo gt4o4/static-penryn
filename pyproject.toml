@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "static-penryn"
+# By hand, here and in nix-configs' common/pkgs/static-penryn.nix.
+version = "0.1.0"
+description = "Offline ELF64 rewriter that replaces SSE4.2 and POPCNT with scalar/SSE2 code for Penryn"
+readme = "README.md"
+license = "GPL-2.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Bingchen Gong" }]
+requires-python = ">=3.12"
+dependencies = [
+    "iced-x86>=1.21,<2",
+    "pyelftools>=0.33",
+    "pwntools>=4.15,<5",
+    # The assembler's setjmp/longjmp shim is verified per llvmlite release
+    # (AGENTS.md, Invariants).
+    "llvmlite>=0.46,<0.47",
+]
+
+[project.urls]
+Homepage = "https://github.com/gt4o4/static-penryn"
+
+[project.scripts]
+static-penryn = "static_penryn.cli:main"
+
+[tool.setuptools]
+packages = ["static_penryn"]
+
+[tool.setuptools.package-data]
+# The string helpers' and profiler plugin's C, the plugin header and its
+# license, and the Go metadata helper's source.
+static_penryn = ["*.c", "*.h", "*.go", "qemu-plugin.LICENSE"]
