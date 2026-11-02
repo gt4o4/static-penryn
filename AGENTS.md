@@ -14,8 +14,9 @@ nix-configs uses the tool as follows:
   `default.nix` here is only a shim that builds a checkout with that
   recipe.
 - iMacGBC's `hosts/iMacGBC/penryn-overlays.nix` rewrites Claude Code and agy
-  with it at build time (since 2026-11-02, effective from that host's next
-  switch).
+  with it at build time (since generation 486, 2026-11-02). The
+  Antigravity IDE's agent is that agy (`agy --hub`); the hub's own
+  `language_server` and `webm_encoder` are not rewritten.
 - A pushed change reaches iMacGBC only when the pin moves (rev and hash in
   `common/pkgs/default.nix`; `docs/bumping/static-penryn.md` there).
 - opemu stays for everything else: don't retire it, and don't combine this

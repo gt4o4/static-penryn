@@ -13,7 +13,8 @@ core of `gt4o4/opemu-linux`: `CORE_HASHES` pins its two files, validated at
   at build time, with the options validated below.
 - It checks both on a QEMU Penryn model with no emulator, and keeps each
   report under `share/static-penryn/`.
-- iMacGBC runs the rewritten binaries from its next switch.
+- iMacGBC has run the rewritten binaries since generation 486
+  (2026-11-02).
 - Everything else still runs on opemu, so don't retire it, and don't combine
   this with CPUID spoofing.
 
@@ -175,8 +176,15 @@ patched both installed payloads; both originals die of SIGILL there.
     workloads.
   - 1,355 sites; the 52 Go sites have no runtime metadata, and 56 ranges
     lack unwind rows.
-- Both also ran natively on iMacGBC, as a sanity check: opemu was active
-  there.
+
+**2026-11-02, installed on iMacGBC (generation 486).** The installed
+payloads are the two outputs above. opemu's counters are global, so each
+run was measured against an idle window of the same length.
+- Emulated instructions per `--version` fell to the idle level: from about
+  520 for Claude, and from 91,000–114,000 for agy.
+- `agy --hub`, run with the IDE's environment, served its port within a
+  second and stayed up. No trap site sampled over 20 s lay in its
+  mappings.
 
 ## Development
 
