@@ -6,8 +6,20 @@ static-penryn is an experimental offline ELF64 rewriter for iMacGBC's Core 2
 Duo (Penryn: no SSE4.2, no POPCNT); README.md has its status, usage,
 boundaries and records. It is its own repository (`gt4o4/static-penryn`), checked
 out gitignored at nix-configs' `submodules/static-penryn/`, so nix-configs'
-AGENTS.md and its fleet rules load here too. nix-configs does not enable it:
-don't retire opemu on its account or combine it with CPUID spoofing.
+AGENTS.md and its fleet rules load here too.
+
+nix-configs uses the tool as follows:
+- It packages it as `pkgs.custom.static-penryn`
+  (`common/pkgs/static-penryn.nix`, the one recipe, pinned by rev).
+  `default.nix` here is only a shim that builds a checkout with that
+  recipe.
+- iMacGBC's `hosts/iMacGBC/penryn-overlays.nix` rewrites Claude Code and agy
+  with it at build time (since 2026-11-02, effective from that host's next
+  switch).
+- A pushed change reaches iMacGBC only when the pin moves (rev and hash in
+  `common/pkgs/default.nix`; `docs/bumping/static-penryn.md` there).
+- opemu stays for everything else: don't retire it, and don't combine this
+  with CPUID spoofing.
 
 ## Toolchain: x86-64 only
 
@@ -140,8 +152,9 @@ binds a profile to its `output_sha256` and exact stub ranges, and
 - **Only opemu's arithmetic is reused.** `CORE_HASHES` pins its two files,
   and a mismatch fails any input containing PCMPxSTRx. A core change means
   new hashes, README's revision and a `test_strings` oracle run.
-- **The package is `static_penryn/`.** `default.nix` packages exactly that
-  directory minus `__pycache__`, so anything placed there ships.
+- **The package is `static_penryn/`.** nix-configs' recipe packages exactly
+  that directory minus `__pycache__`, so anything placed there ships, and at
+  the next pin bump it changes iMacGBC's Claude Code and agy.
 - **Correct output is the criterion, not byte equality with GNU tools.**
   Check equivalence by decoded content (`tests.structdiff`).
 - **The assembler shim is undefined behaviour by the C standard**, the

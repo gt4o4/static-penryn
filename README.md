@@ -7,10 +7,18 @@ SIGILL handler or preload. The string arithmetic is compiled from the MIT
 core of `gt4o4/opemu-linux`: `CORE_HASHES` pins its two files, validated at
 `6641be6` and unchanged at nix-configs' pin `2a5ee2d3` (checked 2026-11-01).
 
-**An experiment, not enabled in nix-configs** (`penryn-overlays.nix`): don't
-retire opemu on its account or combine it with CPUID spoofing. It has been its
-own repository since 2026-09-29, checked out gitignored at nix-configs'
-`submodules/static-penryn/`.
+**Packaged by nix-configs since 2026-11-02** as `pkgs.custom.static-penryn`
+(`common/pkgs/static-penryn.nix`, pinned by rev).
+- `hosts/iMacGBC/penryn-overlays.nix` rewrites Claude Code and agy with it
+  at build time, with the options validated below.
+- It checks both on a QEMU Penryn model with no emulator, and keeps each
+  report under `share/static-penryn/`.
+- iMacGBC runs the rewritten binaries from its next switch.
+- Everything else still runs on opemu, so don't retire it, and don't combine
+  this with CPUID spoofing.
+
+It has been its own repository since 2026-09-29, checked out gitignored at
+nix-configs' `submodules/static-penryn/`.
 
 ## Status
 
