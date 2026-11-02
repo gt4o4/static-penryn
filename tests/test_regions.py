@@ -11,6 +11,7 @@ from collections.abc import Container, Iterable, Mapping, Sequence
 import io
 import json
 from pathlib import Path
+import re
 import resource
 import shlex
 import subprocess
@@ -72,6 +73,18 @@ def prepared(code: str) -> tuple[list[ix.Instruction], list[Site]]:
 
 PAIR = 'f3480fb8c1 4889f2 f34c0fb8c2'  # popcnt rax,rcx; mov rdx,rsi; popcnt r8,rdx
 MASK = '660fd7f1 f30fb8f6'  # pmovmskb esi,xmm1; popcnt esi,esi
+# Claude Code 2.1.316's eight-qword count at 0x3489c86, with RDI for its RAX
+# base: popcnt rsi,[rdi]; popcnt r8,[rdi+8]; popcnt r9,[rdi+16]; add rsi,rdx;
+# add r9,r8; popcnt rdx,[rdi+24]; add r9,rsi; popcnt rsi,[rdi+32]; add rsi,rdx;
+# popcnt r8,[rdi+40]; add r8,rsi; add r8,r9; popcnt rsi,[rdi+48];
+# popcnt rdx,[rdi+56]
+QWORDS = ('f3480fb837 f34c0fb84708 f34c0fb84f10 4801d6 4d01c1 f3480fb85718 4901f1 '
+          'f3480fb87720 4801d6 f34c0fb84728 4901f0 4d01c8 f3480fb87730 f3480fb85738')
+
+
+def clears(count: int) -> str:
+    """pxor xmmK,xmmK for K below count: a region using that many XMMs."""
+    return ' '.join(f'66{"45" if k >= 8 else ""}0fef{0xc0 | (k % 8) << 3 | k % 8:02x}' for k in range(count))
 
 
 class GroupOptions(TypedDict, total=False):
@@ -214,9 +227,57 @@ class RegionTests(unittest.TestCase):
                 self.assertIn('imul', self.masked(code))
 
     def test_mask_count_falls_back_without_two_free_xmms(self) -> None:
-        clears = ' '.join(f'66{"45" if k >= 8 else ""}0fef{0xc0 | (k % 8) << 3 | k % 8:02x}'
-                          for k in range(15))
-        self.assertIn('imul', self.masked(clears + ' 66410fd7f7 f30fb8f6'))
+        self.assertIn('imul', self.masked(clears(15) + ' 66410fd7f7 f30fb8f6'))
+
+    def test_qword_pairs_need_no_memory_access_and_unwritten_address_registers(self) -> None:
+        cases: list[tuple[str, dict[int, int]]] = [
+            ('f3480fb807 f3480fb84f08', {0: 1}),  # popcnt rax,[rdi]; popcnt rcx,[rdi+8]
+            ('f3480fb807 f3480fb84f08 f3480fb85710', {0: 1}),  # a third stays scalar
+            ('f3480fb807 f3480fb84f08 f3480fb85710 f3480fb87718', {0: 1, 2: 3}),
+            ('f3480fb807 f3480fb8d6 f3480fb84f08', {0: 2}),  # popcnt rdx,rsi between
+            ('f3480fb804cf f3480fb816', {0: 1}),  # [rdi+rcx*8], then [rsi]
+            (QWORDS, {0: 1, 2: 5, 7: 9, 12: 13}),
+            ('f3480fb809 f3480fb85108', {}),  # popcnt rcx,[rcx] writes the next base
+            ('f3480fb807 4883c708 f3480fb84f08', {}),  # add rdi,8 between
+            ('f3480fb807 488b16 f3480fb84f08', {}),  # mov rdx,[rsi] between
+            ('f3480fb807 488b16 f3480fb84f08 f3480fb85710', {2: 3}),
+            ('f30fb807 f30fb84f04', {}),  # 32-bit POPCNTs
+            ('f3480fb807 67f3480fb84f08', {}),  # addr32 [edi+8]
+            ('f3480fb80500010000 f3480fb807', {}),  # RIP-relative, then [rdi]
+            ('f3480fb807 f3480fb80500010000', {}),
+        ]
+        for code, expected in cases:
+            with self.subTest(code=code):
+                self.assertEqual(regions.qword_pairs(decode(code)), expected)
+
+    def lowered(self, code: str) -> tuple[list[ix.Instruction], list[str | None]]:
+        instructions, sites = prepared(code)
+        _, bodies, _, _ = regions.shared_lowering(instructions, {s.ip: Hints() for s in sites})
+        return instructions, bodies
+
+    def test_pair_keeps_its_hold_across_the_steps_between(self) -> None:
+        # popcnt rax,[rdi]; pmovmskb esi,xmm1; popcnt esi,esi; popcnt rcx,[rdi+8]
+        for code in ('f3480fb807 660fd7f1 f30fb8f6 f3480fb84f08', QWORDS,
+                     clears(13) + ' f3480fb807 f3480fb84f08'):
+            with self.subTest(code=code):
+                instructions, bodies = self.lowered(code)
+                pairs = regions.qword_pairs(instructions)
+                self.assertTrue(pairs)
+                for first, second in pairs.items():
+                    match = re.search(r'movhps (xmm\d+),', present(bodies[first]))
+                    assert match is not None
+                    hold = match.group(1)
+                    self.assertIn('pextrq', present(bodies[second]))
+                    self.assertRegex(present(bodies[second]), rf'\b{hold}\b')
+                    for between in range(first + 1, second):
+                        self.assertNotRegex(bodies[between] or '', rf'\b{hold}\b')
+                self.assertNotIn('imul', '\n'.join(b for b in bodies if b is not None))
+
+    def test_pair_falls_back_without_three_free_xmms(self) -> None:
+        _, bodies = self.lowered(clears(14) + ' f3480fb807 f3480fb84f08')
+        text = '\n'.join(b for b in bodies if b is not None)
+        self.assertNotIn('movhps', text)
+        self.assertEqual(text.count('imul'), 2)
 
     def test_shared_frame_rejects_ineligible_steps_without_mutation(self) -> None:
         instructions, sites = prepared('f3480fb8c1 488b17 f34c0fb8c2')
@@ -304,6 +365,34 @@ def oracle_cases() -> list[tuple[str, str, bool]]:
         ('pmovmskb ecx, xmm3\npopcnt rax, rcx', 'register', False),
         ('pmovmskb r15d, xmm0\npopcnt r14, r15', 'register', False),
         ('pmovmskb edx, xmm15\npopcnt edx, edx\npmovmskb edx, xmm14\npopcnt ecx, edx', 'register', False),
+        # POPCNT pairs: Claude Code 2.1.316's eight-qword count at 0x3489c86
+        # exactly; a third qword alone; RAX destinations; non-adjacent,
+        # reversed, indexed and different-base pairs; a base written between
+        # (scalar); loads around a pair and between two (scalar); a mask
+        # count and a PCMPGTQ inside a pair; temporaries that the dataflow
+        # proves dead; the hold in XMM15.
+        ('mov rax, rdi\npopcnt rdi, QWORD PTR [rax]\npopcnt r8, QWORD PTR [rax+8]\n'
+         'popcnt r9, QWORD PTR [rax+16]\nadd rdi, rdx\nadd r9, r8\npopcnt rdx, QWORD PTR [rax+24]\n'
+         'add r9, rdi\npopcnt rdi, QWORD PTR [rax+32]\nadd rdi, rdx\npopcnt r8, QWORD PTR [rax+40]\n'
+         'add r8, rdi\nadd r8, r9\npopcnt rdi, QWORD PTR [rax+48]\npopcnt rdx, QWORD PTR [rax+56]', 'base', False),
+        ('popcnt rax, QWORD PTR [rdi]\npopcnt rcx, QWORD PTR [rdi+8]\npopcnt rdx, QWORD PTR [rdi+16]', 'base', False),
+        ('popcnt rax, QWORD PTR [rdi+16]\npopcnt rcx, QWORD PTR [rdi+24]\n'
+         'popcnt rcx, QWORD PTR [rdi+32]\npopcnt rax, QWORD PTR [rdi+40]', 'base', False),
+        ('popcnt rax, QWORD PTR [rdi]\npopcnt rcx, QWORD PTR [rdi+32]', 'base', False),
+        ('popcnt rax, QWORD PTR [rdi+48]\npopcnt rcx, QWORD PTR [rdi]', 'base', False),
+        ('popcnt rax, QWORD PTR [rdi+rcx*8]\npopcnt rdx, QWORD PTR [rdi+rcx*8+8]', 'indexed', False),
+        ('lea rsi, [rdi+16]\npopcnt rax, QWORD PTR [rdi]\npopcnt rdx, QWORD PTR [rsi+8]', 'base', False),
+        ('popcnt rax, QWORD PTR [rdi]\nadd rdi, 8\npopcnt rcx, QWORD PTR [rdi+8]', 'base', False),
+        ('mov rdx, QWORD PTR [rdi+56]\npopcnt rax, QWORD PTR [rdi]\npopcnt rcx, QWORD PTR [rdi+8]\n'
+         'mov rsi, QWORD PTR [rdi+16]\npopcnt r8, QWORD PTR [rdi+24]\nmov r9, QWORD PTR [rdi+32]\n'
+         'popcnt r10, QWORD PTR [rdi+40]', 'base', True),
+        ('popcnt rax, QWORD PTR [rdi]\npmovmskb esi, xmm1\npopcnt esi, esi\npopcnt rcx, QWORD PTR [rdi+8]',
+         'base', False),
+        ('popcnt rax, QWORD PTR [rdi]\npcmpgtq xmm0, xmm1\npopcnt rcx, QWORD PTR [rdi+8]', 'base', False),
+        ('popcnt rax, QWORD PTR [rdi]\npxor xmm0, xmm0\npxor xmm1, xmm1\npopcnt rcx, QWORD PTR [rdi+8]',
+         'base', False),
+        ('\n'.join(f'pxor xmm{k}, xmm{k}' for k in range(13))
+         + '\npopcnt r15, QWORD PTR [rdi+40]\npopcnt r14, QWORD PTR [rdi+48]', 'base', False),
         ('\n'.join(f'popcnt {register}, {register}' for register in registers), 'register', False),
         ('\n'.join(f'pcmpgtq xmm{k}, xmm{(k + 1) % 16}' for k in range(16)), 'register', False),
     ])

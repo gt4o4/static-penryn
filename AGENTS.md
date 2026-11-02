@@ -288,6 +288,24 @@ On agy 1.2.7 the initializer ran once (37 instructions), and
     form; flags use its SAHF tail.
   - Claude Code 2.1.316's byte-count loop is the measured case: four such
     POPCNTs per 64 bytes, 43,213 iterations in its ripgrep workloads.
+- **Two POPCNT r64, m64 of a fused region count as a pair (0.3.0,
+  2026-11-02).**
+  - `regions.qword_pairs` pairs each with the next such step. Two facts
+    prove that loading the later qword early reads what that POPCNT would
+    have read: no step between accesses memory, and none from the first on
+    writes a register of the later address. Displacements are not compared.
+  - The first loads both qwords (MOVQ, then MOVHPS) and counts them at
+    once with PSHUFB nibble lookups and PSADBW. The later count waits in
+    hold, the last of the region's free XMM registers, which no lowering
+    between takes; the later POPCNT extracts it with PEXTRQ.
+  - RIP-relative and addr32 sources stay scalar, since the region oracle
+    cannot reach them, as does a pair whose first lacks two more dead or
+    free XMM registers. Pairs never overlap.
+  - The shape is Claude Code 2.1.316's 142 regions of eight consecutive
+    qwords with `add` glue, four pairs each. Their straight-line stubs run
+    89–99 instructions instead of 151–163, the saves of the three XMM
+    registers included. They never ran in the seven workloads, so that
+    count is the whole measurement.
 - **A data word is a pointer target only in an ET_EXEC image
   (2026-11-02).**
   - A static executable's pointer arrays lose their relocations at link

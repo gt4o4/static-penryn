@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "static-penryn"
 # By hand, here and in nix-configs' common/pkgs/static-penryn.nix.
-version = "0.2.0"
+version = "0.3.0"
 description = "Offline ELF64 rewriter that replaces SSE4.2 and POPCNT with scalar/SSE2 code for Penryn"
 readme = "README.md"
 license = "GPL-2.0-or-later"

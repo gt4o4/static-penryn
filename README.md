@@ -2,10 +2,11 @@
 
 An offline ELF64 rewriter for iMacGBC's Core 2 Duo (Penryn: no SSE4.2, no
 POPCNT). It replaces POPCNT, CRC32, PCMPGTQ and PCMPxSTRx with jumps to
-scalar/SSE2 code appended to the same executable, which then needs no opemu,
-SIGILL handler or preload. The string arithmetic is compiled from the MIT
-core of `gt4o4/opemu-linux`: `CORE_HASHES` pins its two files, validated at
-`6641be6` and unchanged at nix-configs' pin `2a5ee2d3` (checked 2026-11-01).
+scalar and SSE code (up to Penryn's SSE4.1) appended to the same
+executable, which then needs no opemu, SIGILL handler or preload. The
+string arithmetic is compiled from the MIT core of `gt4o4/opemu-linux`:
+`CORE_HASHES` pins its two files, validated at `6641be6` and unchanged at
+nix-configs' pin `2a5ee2d3` (checked 2026-11-01).
 
 **Packaged by nix-configs since 2026-11-02** as `pkgs.custom.static-penryn`
 (`common/pkgs/static-penryn.nix`, pinned by rev).
@@ -112,6 +113,9 @@ env -u LD_PRELOAD qemu-x86_64 -cpu Penryn OUTPUT --version
   and shared libraries are not rewritten. AVX, AES-NI, PCLMULQDQ and BMI
   are left as they are: behind the program's own CPU dispatch, or, compiled
   in, to opemu.
+- A POPCNT pair in a fused region (AGENTS.md, Decisions) loads its later
+  qword at the earlier POPCNT. A fault of that load is raised there, before
+  the earlier destination and the steps between are written.
 - Rewrite last. A later `patchelf` or `strip` that rewrites program headers
   breaks the output: antigravity-hub's autoPatchelf did, and the binary
   died of SIGSEGV.
@@ -237,6 +241,36 @@ section of its own, so outputs without a mask count keep their bytes (agy's
 `3f549ea2…`). nix-configs pins 0.2.0 in `a7362526`; iMacGBC has run it
 since generation 490 (2026-11-02, 17:15), where `claude --version` and
 `agy --version` emulate 0 instructions.
+
+**2026-11-02, 0.3.0: POPCNT pairs.** In a fused region, two `popcnt r64,
+m64` with no memory access between them, and the later address unwritten,
+are counted together (AGENTS.md, Decisions).
+- Claude Code 2.1.316 (input `0f5efad9…a95a`) gives `36ed361e…5d70`, with
+  602 pairs in 158 regions. Its 142 eight-qword regions, four pairs each,
+  run 89–99 instructions per execution instead of 151–163, counted in their
+  straight-line stubs, the saves of three XMM registers included.
+- None of the 158 regions ran in the seven workloads, so this is a static
+  count, not a measured gain. The change was made at the owner's word
+  without a profile.
+- The output passes `--version` and `--help` on QEMU Penryn with no
+  emulator, and its five workloads; the original dies of SIGILL.
+- A new integration fixture runs pairs there: Claude's region and eight
+  POPCNTs into distinct registers, each count checked.
+- The byte-count loop's mask-count stub is the same 65 instructions as in
+  0.2.0, apart from addresses.
+- agy 1.4.12 has no fused regions, so its output keeps its bytes
+  (`3f549ea2…f70c`).
+- On lix-ory, the region oracle passed 34,800 comparisons and the lowering
+  oracle 465,280. The region oracle's new cases cover:
+  - Claude's region exactly;
+  - non-adjacent, reversed, indexed and different-base pairs;
+  - a base written between two POPCNTs, and loads around a pair and
+    between two;
+  - a mask count and a PCMPGTQ inside a pair;
+  - the hold in XMM15.
+
+  The same oracle failed a lowering without the high-nibble mask, at
+  Claude's region.
 
 ## Development
 

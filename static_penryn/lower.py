@@ -247,6 +247,32 @@ def _popcnt_flags(count: str) -> list[str]:
     return [f"cmp {count}, 1", "sbb ah, ah", "and ah, 64", "sahf"]
 
 
+def _count_register(ins: ix.Instruction, preserve_flags: bool,
+                    dead_registers: frozenset[int]) -> tuple[list[ix.Register_], ix.Register_]:
+    """Scratch GPRs and the register that receives a count made in XMM.
+
+    The flags need AH: RAX is saved, or, as the destination, written last
+    from another register (_count_tail).
+    """
+    destination = ix.RegisterExt.full_register(ins.op0_register)
+    if destination == ix.Register.RSP:
+        raise LoweringError("RSP/ESP/SP destinations require a different trampoline")
+    if not preserve_flags:
+        return [], destination
+    if destination == ix.Register.RAX:
+        scratch = _scalar_scratch(ins, 1, dead_registers)
+        return scratch, scratch[0]
+    return [ix.Register.RAX], destination
+
+
+def _count_tail(ins: ix.Instruction, value: ix.Register_, size: int, preserve_flags: bool) -> list[str]:
+    count = _reg(value, size)
+    lines = _popcnt_flags(count) if preserve_flags else []
+    if value != ix.RegisterExt.full_register(ins.op0_register):
+        lines.append(f"mov {_reg(ins.op0_register, size)}, {count}")
+    return lines
+
+
 def _popcnt_mask(ins: ix.Instruction, mask: int, preserve_flags: bool,
                  dead_registers: frozenset[int], dead_xmms: frozenset[int]) -> list[str] | None:
     """POPCNT of a PMOVMSKB result, counted from that PMOVMSKB's XMM source.
@@ -263,19 +289,7 @@ def _popcnt_mask(ins: ix.Instruction, mask: int, preserve_flags: bool,
     temporaries = sorted(r for r in dead_xmms if r != mask)[:2]
     if len(temporaries) < 2:
         return None
-    destination = ix.RegisterExt.full_register(ins.op0_register)
-    if destination == ix.Register.RSP:
-        raise LoweringError("RSP/ESP/SP destinations require a different trampoline")
-    scratch: list[ix.Register_] = []
-    value = destination
-    if preserve_flags:
-        # The flags need AH: RAX is saved, or, as the destination, written
-        # last from another register.
-        if destination == ix.Register.RAX:
-            scratch = _scalar_scratch(ins, 1, dead_registers)
-            value = scratch[0]
-        else:
-            scratch = [ix.Register.RAX]
+    scratch, value = _count_register(ins, preserve_flags, dead_registers)
     saved, _ = _frame(scratch, False, dead_registers)
     count = _reg(value, size)
     bytes_, zero = (reg_name(r) for r in temporaries)
@@ -285,11 +299,65 @@ def _popcnt_mask(ins: ix.Instruction, mask: int, preserve_flags: bool,
               f"pand {bytes_}, XMMWORD PTR [rip + .Lpenryn_ones8]", f"pxor {zero}, {zero}",
               f"psadbw {bytes_}, {zero}", f"pshufd {zero}, {bytes_}, 0x4e",
               f"paddq {bytes_}, {zero}", f"{'movq' if size == 8 else 'movd'} {count}, {bytes_}"]
-    if preserve_flags:
-        lines += _popcnt_flags(count)
-    if value != destination:
-        lines.append(f"mov {_reg(destination, size)}, {count}")
-    return lines + _epilogue(saved, False)
+    return lines + _count_tail(ins, value, size, preserve_flags) + _epilogue(saved, False)
+
+
+def pairable(ins: ix.Instruction) -> bool:
+    """POPCNT r64, m64 with 64-bit base/index addressing, the form that
+    regions.qword_pairs counts in pairs. RIP-relative and addr32 sources
+    stay scalar: the region oracle cannot reach them."""
+    if (ins.mnemonic != ix.Mnemonic.POPCNT or ins.op0_kind != ix.OpKind.REGISTER
+            or not ix.RegisterExt.is_gpr64(ins.op0_register) or ins.op1_kind != ix.OpKind.MEMORY):
+        return False
+    return (ix.MemorySizeExt.size(ins.memory_size) == 8 and _address_size(ins) == ix.CodeSize.CODE64
+            and ins.memory_base not in (ix.Register.RIP, ix.Register.EIP)
+            and ins.memory_segment == ix.Register.DS)
+
+
+def _popcnt_pair(ins: ix.Instruction, second: ix.Instruction, hold: int, preserve_flags: bool,
+                 dead_registers: frozenset[int], dead_xmms: frozenset[int]) -> list[str]:
+    """POPCNT r64, m64 that also counts a later one's source into hold.
+
+    Both qwords are loaded here, in program order (MOVQ zeroes the upper
+    half, so it comes first), and counted at once: PSHUFB looks up each
+    nibble's bit count and PSADBW sums each qword's bytes. This destination
+    takes the low count; the later POPCNT takes the high one from hold
+    (_popcnt_held). Two dead XMM temporaries besides hold, no stack but the
+    flags' RAX save. Only regions.qword_pairs proves a pair.
+    """
+    if not (pairable(ins) and pairable(second)):
+        raise LoweringError("a POPCNT pair counts two r64, m64 sources")
+    temporaries = sorted(r for r in dead_xmms if r != hold)[:2]
+    if len(temporaries) < 2:
+        raise LoweringError("a POPCNT pair needs two dead XMM registers besides its hold")
+    scratch, value = _count_register(ins, preserve_flags, dead_registers)
+    saved, stack_delta = _frame(scratch, False, dead_registers)
+    counts = reg_name(hold)
+    high, low = (reg_name(r) for r in temporaries)
+    lines = _prologue(saved, False)
+    lines += [memory_load(ins, counts, stack_delta, "movq"),
+              memory_load(second, counts, stack_delta, "movhps"),
+              # The word shift drags each byte's neighbour down: mask after it.
+              f"movdqa {high}, {counts}", f"psrlw {high}, 4",
+              f"pand {counts}, XMMWORD PTR [rip + .Lpenryn_nibbles]",
+              f"pand {high}, XMMWORD PTR [rip + .Lpenryn_nibbles]",
+              # PSHUFB shuffles its destination, the table, by the nibbles.
+              f"movdqa {low}, XMMWORD PTR [rip + .Lpenryn_nibble_counts]", f"pshufb {low}, {counts}",
+              f"movdqa {counts}, XMMWORD PTR [rip + .Lpenryn_nibble_counts]", f"pshufb {counts}, {high}",
+              f"paddb {counts}, {low}", f"pxor {low}, {low}", f"psadbw {counts}, {low}",
+              f"movq {_reg(value)}, {counts}"]
+    return lines + _count_tail(ins, value, 8, preserve_flags) + _epilogue(saved, False)
+
+
+def _popcnt_held(ins: ix.Instruction, hold: int, preserve_flags: bool,
+                 dead_registers: frozenset[int]) -> list[str]:
+    """The later POPCNT of a pair: its count waits in hold's high qword."""
+    if not pairable(ins):
+        raise LoweringError("a POPCNT pair counts two r64, m64 sources")
+    scratch, value = _count_register(ins, preserve_flags, dead_registers)
+    saved, _ = _frame(scratch, False, dead_registers)
+    lines = _prologue(saved, False) + [f"pextrq {_reg(value)}, {reg_name(hold)}, 1"]
+    return lines + _count_tail(ins, value, 8, preserve_flags) + _epilogue(saved, False)
 
 
 def _crc32(ins: ix.Instruction, preserve_flags: bool, dead_registers: frozenset[int]) -> list[str]:
@@ -408,13 +476,20 @@ def support_assembly() -> str:
     # legacy PAND needs the alignment.
     lines += ['.section .rodata.penryn.ones8,"a",@progbits', '.balign 16', '.Lpenryn_ones8:',
               '.quad 0x0101010101010101, 0x0101010101010101']
+    # The nibble mask and the bit count of each nibble value for POPCNT
+    # pairs, likewise in a section of their own; legacy PAND and MOVDQA
+    # need the alignment.
+    lines += ['.section .rodata.penryn.nibbles,"a",@progbits', '.balign 16', '.Lpenryn_nibbles:',
+              '.quad 0x0f0f0f0f0f0f0f0f, 0x0f0f0f0f0f0f0f0f', '.Lpenryn_nibble_counts:',
+              '.byte ' + ', '.join(str(n.bit_count()) for n in range(16))]
     return "\n".join(lines) + "\n"
 
 
 def lower(ins: ix.Instruction, *, preserve_flags: bool = True,
           dead_registers: frozenset[int] = frozenset(),
           dead_xmms: frozenset[int] = frozenset(),
-          mask_source: int | None = None) -> str:
+          mask_source: int | None = None, hold: int | None = None,
+          pair_second: ix.Instruction | None = None) -> str:
     """Return leaf Intel-syntax GAS, excluding header and continuation jump.
 
     Defaults preserve every non-output register and architecturally specified
@@ -424,6 +499,11 @@ def lower(ins: ix.Instruction, *, preserve_flags: bool = True,
     mask_source names, for a POPCNT, the XMM register whose PMOVMSKB wrote
     its source; only a caller that proved it (regions: the PMOVMSKB is the
     step just before) may pass it.
+    hold names the XMM register that carries a POPCNT pair's counts: with
+    pair_second, the later POPCNT of the pair, this POPCNT loads and counts
+    both sources; without, this POPCNT is that later one and takes its
+    count from hold. Only a caller that proved the pair and keeps hold
+    intact between the two (regions.qword_pairs) may pass them.
     """
     if ins.has_lock_prefix:
         raise LoweringError("LOCK-prefixed instruction cannot be lowered")
@@ -434,7 +514,14 @@ def lower(ins: ix.Instruction, *, preserve_flags: bool = True,
     if mask_source is not None and (ins.mnemonic != ix.Mnemonic.POPCNT
                                     or not ix.Register.XMM0 <= mask_source <= ix.Register.XMM15):
         raise LoweringError("mask_source names a legacy XMM register feeding a POPCNT")
-    if ins.mnemonic == ix.Mnemonic.POPCNT:
+    if (pair_second is not None and hold is None) or (hold is not None and (
+            ins.mnemonic != ix.Mnemonic.POPCNT or mask_source is not None
+            or not ix.Register.XMM0 <= hold <= ix.Register.XMM15)):
+        raise LoweringError("hold names a legacy XMM register carrying a POPCNT pair's counts")
+    if ins.mnemonic == ix.Mnemonic.POPCNT and hold is not None:
+        lines = (_popcnt_held(ins, hold, preserve_flags, dead_registers) if pair_second is None
+                 else _popcnt_pair(ins, pair_second, hold, preserve_flags, dead_registers, dead_xmms))
+    elif ins.mnemonic == ix.Mnemonic.POPCNT:
         masked = (None if mask_source is None
                   else _popcnt_mask(ins, mask_source, preserve_flags, dead_registers, dead_xmms))
         lines = masked if masked is not None else _popcnt(ins, preserve_flags, dead_registers)

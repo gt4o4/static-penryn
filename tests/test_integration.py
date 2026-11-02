@@ -5,6 +5,7 @@ These small syscall-only ELFs execute as rewritten payloads under QEMU Penryn.
 Their original code, reports, target tables and relocated branch/RIP operands
 are checked together; lower-level arithmetic and unit tests live elsewhere.
 """
+from collections.abc import Iterable
 import hashlib
 import json
 from pathlib import Path
@@ -16,7 +17,7 @@ import tempfile
 from typing import Literal, overload
 import unittest
 
-from iced_x86 import Decoder, FlowControl
+from iced_x86 import Decoder, FlowControl, Mnemonic
 from static_penryn import patch
 from static_penryn.checked import as_int, as_list, as_object, as_str, load_json
 from static_penryn.elfcheck import validate_elf
@@ -157,6 +158,41 @@ class IntegrationTests(unittest.TestCase):
         mnemonics = [row['mnemonic'] for row in ranges]
         expected = ['POPCNT', 'MOV', 'POPCNT']
         self.assertEqual(mnemonics, expected)
+        self.assert_ranges(binary, output, report)
+        self.penryn(output)
+
+    def test_qword_popcnt_pairs_run_on_penryn(self) -> None:
+        # Claude Code 2.1.316's eight-qword count (0x3489c86, RAX its base),
+        # then eight distinct destinations, each checked: two regions of four
+        # POPCNT pairs, whose MOVHPS, PSHUFB and PEXTRQ run on QEMU's Penryn.
+        words = [0, (1 << 64) - 1, 0x8000000000000001, 0xF0F0F0F0F0F0F0F0,
+                 0x7FFFFFFFFFFFFFFE, 0x0123456789ABCDEE, 0xAAAAAAAAAAAAAAA0, 0x00000000FFFF0001]
+        counts = [word.bit_count() for word in words]
+        region = ('popcnt rdi,[rax]\npopcnt r8,[rax+8]\npopcnt r9,[rax+16]\nadd rdi,rdx\nadd r9,r8\n'
+                  'popcnt rdx,[rax+24]\nadd r9,rdi\npopcnt rdi,[rax+32]\nadd rdi,rdx\n'
+                  'popcnt r8,[rax+40]\nadd r8,rdi\nadd r8,r9\npopcnt rdi,[rax+48]\npopcnt rdx,[rax+56]\n')
+        # RDX is zero on entry.
+        sums = [('rdi', counts[6]), ('rdx', counts[7]), ('r8', sum(counts[:6])), ('r9', sum(counts[:3]))]
+        registers = ['rdi', 'rsi', 'r8', 'r9', 'r10', 'r11', 'rcx', 'rdx']
+        distinct = ''.join(f'popcnt {register},[rax+{8 * k}]\n' for k, register in enumerate(registers))
+
+        def checks(values: Iterable[tuple[str, int]]) -> str:
+            return ''.join(f'cmp {register},{value}\njne .Lfail\n' for register, value in values)
+        binary = self.fixture('lea rax,[rip+.Lwords]\nxor edx,edx\n' + region + checks(sums)
+                              + distinct + checks(zip(registers, counts)),
+                              extra='.section .rodata\n.balign 8\n.Lwords: .quad '
+                              + ', '.join(hex(word) for word in words))
+        self.penryn(binary, success=False)
+        output, report = self.invoke(binary, '--regions', '--allow-relocate')
+        self.assertEqual(report['fused_regions'], 2)
+        data, elf = output.read_bytes(), self.elf(output)
+        pairs = 0
+        for row in objects(report['patches'], 'patches'):
+            start, end = hexint(row['stub'], 'stub'), hexint(row['stub_end'], 'stub_end')
+            offset = patch.va_offset(elf, start)
+            pairs += sum(ins.mnemonic == Mnemonic.MOVHPS
+                         for ins in Decoder(64, data[offset:offset + end - start], ip=start))
+        self.assertEqual(pairs, 8)
         self.assert_ranges(binary, output, report)
         self.penryn(output)
 
