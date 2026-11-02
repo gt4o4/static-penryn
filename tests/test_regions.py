@@ -71,6 +71,7 @@ def prepared(code: str) -> tuple[list[ix.Instruction], list[Site]]:
 
 
 PAIR = 'f3480fb8c1 4889f2 f34c0fb8c2'  # popcnt rax,rcx; mov rdx,rsi; popcnt r8,rdx
+MASK = '660fd7f1 f30fb8f6'  # pmovmskb esi,xmm1; popcnt esi,esi
 
 
 class GroupOptions(TypedDict, total=False):
@@ -191,6 +192,32 @@ class RegionTests(unittest.TestCase):
         # Both steps are POPCNT, so no body is a None (relocated glue).
         self.assertNotIn('push rax', '\n'.join([present(body) for body in bodies]))
 
+    def masked(self, code: str) -> str:
+        instructions, sites = prepared(code)
+        _, bodies, _, _ = regions.shared_lowering(instructions, {s.ip: Hints() for s in sites})
+        return '\n'.join(body for body in bodies if body is not None)
+
+    def test_popcnt_of_the_adjacent_pmovmskb_counts_its_xmm(self) -> None:
+        # popcnt esi,esi; popcnt rax,rax (flags through another register);
+        # popcnt r8d,esi, each right after the PMOVMSKB that wrote its source.
+        for code in (MASK, '660fd7c2 f3480fb8c0', '660fd7f1 f3440fb8c6'):
+            with self.subTest(code=code):
+                body = self.masked(code)
+                self.assertIn('psadbw', body)
+                self.assertNotIn('imul', body)
+
+    def test_mask_count_needs_adjacency_the_same_register_and_32_or_64_bits(self) -> None:
+        for code in ('660fd7f1 4901f0 f30fb8f6',  # add r8,rsi between them
+                     '660fd7c9 f30fb8f6',  # pmovmskb ecx; popcnt esi,esi
+                     '660fd7f1 66f30fb8f6'):  # popcnt si,si keeps upper bits
+            with self.subTest(code=code):
+                self.assertIn('imul', self.masked(code))
+
+    def test_mask_count_falls_back_without_two_free_xmms(self) -> None:
+        clears = ' '.join(f'66{"45" if k >= 8 else ""}0fef{0xc0 | (k % 8) << 3 | k % 8:02x}'
+                          for k in range(15))
+        self.assertIn('imul', self.masked(clears + ' 66410fd7f7 f30fb8f6'))
+
     def test_shared_frame_rejects_ineligible_steps_without_mutation(self) -> None:
         instructions, sites = prepared('f3480fb8c1 488b17 f34c0fb8c2')
         hints = {s.ip: Hints() for s in sites}
@@ -262,6 +289,21 @@ def oracle_cases() -> list[tuple[str, str, bool]]:
          'pcmpeqb xmm1, xmm0\npmovmskb edx, xmm1\npopcnt edx, edx\n'
          'movdqa xmm1, XMMWORD PTR [rdi+32]\npcmpeqb xmm1, xmm0\n'
          'pmovmskb esi, xmm1\npopcnt esi, esi', 'base', True),
+        # POPCNTs counted from their PMOVMSKB's XMM register: Claude Code
+        # 2.1.316's byte-count loop, full and empty masks, and RAX, r64 and
+        # other-register destinations.
+        ('movdqa xmm1, XMMWORD PTR [rdi]\npcmpeqb xmm1, xmm0\npmovmskb esi, xmm1\n'
+         'popcnt esi, esi\nadd r8, rsi\nmovdqa xmm1, XMMWORD PTR [rdi+16]\n'
+         'pcmpeqb xmm1, xmm0\npmovmskb esi, xmm1\npopcnt esi, esi\n'
+         'movdqa xmm1, XMMWORD PTR [rdi+32]\npcmpeqb xmm1, xmm0\npmovmskb r9d, xmm1\n'
+         'popcnt r9d, r9d\nadd r9, rsi\nadd r9, r8\nmovdqa xmm1, XMMWORD PTR [rdi+48]\n'
+         'pcmpeqb xmm1, xmm0\npmovmskb esi, xmm1\npopcnt r8d, esi', 'base', True),
+        ('pcmpeqb xmm1, xmm1\npmovmskb esi, xmm1\npopcnt esi, esi\n'
+         'pxor xmm2, xmm2\npmovmskb ecx, xmm2\npopcnt ecx, ecx', 'register', False),
+        ('pmovmskb eax, xmm2\npopcnt eax, eax', 'register', False),
+        ('pmovmskb ecx, xmm3\npopcnt rax, rcx', 'register', False),
+        ('pmovmskb r15d, xmm0\npopcnt r14, r15', 'register', False),
+        ('pmovmskb edx, xmm15\npopcnt edx, edx\npmovmskb edx, xmm14\npopcnt ecx, edx', 'register', False),
         ('\n'.join(f'popcnt {register}, {register}' for register in registers), 'register', False),
         ('\n'.join(f'pcmpgtq xmm{k}, xmm{(k + 1) % 16}' for k in range(16)), 'register', False),
     ])

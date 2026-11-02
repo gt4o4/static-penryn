@@ -277,6 +277,17 @@ On agy 1.2.7 the initializer ran once (37 instructions), and
 - **Rewrite, not recompile.** Neither GCC nor LLVM recompiles a stripped
   ELF without a lifter. A C ABI cannot host the replacements: flags, live
   registers, the red zone, aliases and faults are observable.
+- **A POPCNT of the PMOVMSKB just before it counts that PMOVMSKB's XMM
+  register (0.2.0, 2026-11-02).**
+  - In a fused region, `regions.mask_source` hands `lower.lower` the XMM,
+    and the count is the register's sign bits: PCMPGTB, PAND, PSADBW and a
+    qword fold, where the scalar form takes 15 SWAR instructions with an
+    IMUL.
+  - Adjacency is the whole proof that neither register changed. 16-bit
+    POPCNTs and regions without two free XMM registers keep the scalar
+    form; flags use its SAHF tail.
+  - Claude Code 2.1.316's byte-count loop is the measured case: four such
+    POPCNTs per 64 bytes, 43,213 iterations in its ripgrep workloads.
 - **A data word is a pointer target only in an ET_EXEC image
   (2026-11-02).**
   - A static executable's pointer arrays lose their relocations at link

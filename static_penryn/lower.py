@@ -234,12 +234,61 @@ def _popcnt(ins: ix.Instruction, preserve_flags: bool, dead_registers: frozenset
               f"shr {t}, 4", f"add {v}, {t}", f"and {v}, {masks[2]}",
               f"imul {v}, {masks[3]}", f"shr {v}, {width * 8 - 8}"]
     if preserve_flags:
-        # CF from count<1 becomes AH=0x40 iff count==0. AND clears OF,
-        # SAHF sets the other five status flags from AH, and neither changes
-        # DF or control flags. This avoids the expensive serializing POPFQ.
-        lines += [f"cmp {v}, 1", "sbb ah, ah", "and ah, 64", "sahf"]
+        lines += _popcnt_flags(v)
     if ix.RegisterExt.full_register(value) != destination:
         lines.append(f"mov {reg_name(ins.op0_register)}, {_reg(value, size)}")
+    return lines + _epilogue(saved, False)
+
+
+def _popcnt_flags(count: str) -> list[str]:
+    # CF from count<1 becomes AH=0x40 iff count==0. AND clears OF,
+    # SAHF sets the other five status flags from AH, and neither changes
+    # DF or control flags. This avoids the expensive serializing POPFQ.
+    return [f"cmp {count}, 1", "sbb ah, ah", "and ah, 64", "sahf"]
+
+
+def _popcnt_mask(ins: ix.Instruction, mask: int, preserve_flags: bool,
+                 dead_registers: frozenset[int], dead_xmms: frozenset[int]) -> list[str] | None:
+    """POPCNT of a PMOVMSKB result, counted from that PMOVMSKB's XMM source.
+
+    The caller guarantees the source register holds pmovmskb(mask), so the
+    count is the number of mask bytes with their sign bit set: no scalar
+    SWAR, two dead XMM temporaries, no stack. None selects the scalar form:
+    a 16-bit POPCNT, which keeps its destination's upper bits, or fewer
+    than two dead XMM registers besides the mask.
+    """
+    size = ix.RegisterExt.size(ins.op0_register)
+    if size not in (4, 8) or ins.op1_kind != ix.OpKind.REGISTER or _source_size(ins) != size:
+        return None
+    temporaries = sorted(r for r in dead_xmms if r != mask)[:2]
+    if len(temporaries) < 2:
+        return None
+    destination = ix.RegisterExt.full_register(ins.op0_register)
+    if destination == ix.Register.RSP:
+        raise LoweringError("RSP/ESP/SP destinations require a different trampoline")
+    scratch: list[ix.Register_] = []
+    value = destination
+    if preserve_flags:
+        # The flags need AH: RAX is saved, or, as the destination, written
+        # last from another register.
+        if destination == ix.Register.RAX:
+            scratch = _scalar_scratch(ins, 1, dead_registers)
+            value = scratch[0]
+        else:
+            scratch = [ix.Register.RAX]
+    saved, _ = _frame(scratch, False, dead_registers)
+    count = _reg(value, size)
+    bytes_, zero = (reg_name(r) for r in temporaries)
+    lines = _prologue(saved, False)
+    # Sign bits as bytes of 1, summed per half by PSADBW, the halves added.
+    lines += [f"pxor {bytes_}, {bytes_}", f"pcmpgtb {bytes_}, {reg_name(mask)}",
+              f"pand {bytes_}, XMMWORD PTR [rip + .Lpenryn_ones8]", f"pxor {zero}, {zero}",
+              f"psadbw {bytes_}, {zero}", f"pshufd {zero}, {bytes_}, 0x4e",
+              f"paddq {bytes_}, {zero}", f"{'movq' if size == 8 else 'movd'} {count}, {bytes_}"]
+    if preserve_flags:
+        lines += _popcnt_flags(count)
+    if value != destination:
+        lines.append(f"mov {_reg(destination, size)}, {count}")
     return lines + _epilogue(saved, False)
 
 
@@ -354,18 +403,24 @@ def support_assembly() -> str:
     for label, digits in (("55", "5555555555555555"), ("33", "3333333333333333"),
                           ("0f", "0f0f0f0f0f0f0f0f"), ("01", "0101010101010101")):
         lines += [f'.Lpenryn_pop{label}:', f'.quad 0x{digits}']
+    # 16 bytes of 1 for the PMOVMSKB-source count; legacy PAND needs alignment.
+    lines += ['.balign 16', '.Lpenryn_ones8:', '.quad 0x0101010101010101, 0x0101010101010101']
     return "\n".join(lines) + "\n"
 
 
 def lower(ins: ix.Instruction, *, preserve_flags: bool = True,
           dead_registers: frozenset[int] = frozenset(),
-          dead_xmms: frozenset[int] = frozenset()) -> str:
+          dead_xmms: frozenset[int] = frozenset(),
+          mask_source: int | None = None) -> str:
     """Return leaf Intel-syntax GAS, excluding header and continuation jump.
 
     Defaults preserve every non-output register and architecturally specified
     flag. Callers may elide GPR saves or arithmetic-flag restoration only with
     a proof that their original values are dead after this instruction. Even
     with preserve_flags=False, DF and control flags are never changed.
+    mask_source names, for a POPCNT, the XMM register whose PMOVMSKB wrote
+    its source; only a caller that proved it (regions: the PMOVMSKB is the
+    step just before) may pass it.
     """
     if ins.has_lock_prefix:
         raise LoweringError("LOCK-prefixed instruction cannot be lowered")
@@ -373,8 +428,13 @@ def lower(ins: ix.Instruction, *, preserve_flags: bool = True,
         raise LoweringError("dead_registers must contain full non-stack GPRs")
     if any(not ix.Register.XMM0 <= r <= ix.Register.XMM15 for r in dead_xmms):
         raise LoweringError("dead_xmms must contain legacy XMM0..XMM15 registers")
+    if mask_source is not None and (ins.mnemonic != ix.Mnemonic.POPCNT
+                                    or not ix.Register.XMM0 <= mask_source <= ix.Register.XMM15):
+        raise LoweringError("mask_source names a legacy XMM register feeding a POPCNT")
     if ins.mnemonic == ix.Mnemonic.POPCNT:
-        lines = _popcnt(ins, preserve_flags, dead_registers)
+        masked = (None if mask_source is None
+                  else _popcnt_mask(ins, mask_source, preserve_flags, dead_registers, dead_xmms))
+        lines = masked if masked is not None else _popcnt(ins, preserve_flags, dead_registers)
     elif ins.mnemonic == ix.Mnemonic.CRC32:
         lines = _crc32(ins, preserve_flags, dead_registers)
     elif ins.mnemonic == ix.Mnemonic.PCMPGTQ:

@@ -63,7 +63,7 @@ profiling tools.
 
 Without Nix, use a host whose `python3`, `cc` and `ld` are x86-64 (lix-ory,
 not iMacGBC). Install the `static-penryn` command with
-`pip install git+https://github.com/gt4o4/static-penryn` (Python 3.12+;
+`pip install git+https://github.com/gt4o4/static-penryn` (Python 3.13+;
 `-c requirements.txt` pins the tested versions). It then needs:
 - TinyCC's x86-64 `libtcc.so` as `PENRYN_LIBTCC` (AGENTS.md builds the
   package's);
@@ -219,6 +219,20 @@ The AES is an AESENC/AESDEC string hash compiled in with `-maes` (1,344
 instructions), so on QEMU Penryn without an emulator the rewritten server
 still dies of SIGILL. Claude Code's and agy's payloads are unchanged by
 `3a106be` (`a2ffdb40…`, `3f549ea2…`).
+
+**2026-11-02, 0.2.0: POPCNTs of a PMOVMSKB counted in XMM.** Measured with
+the seven workloads in count mode before the change:
+- Claude Code 2.1.316's 145 regions of eight or more POPCNTs never ran.
+- agy 1.4.12's hot POPCNTs are single sites.
+- The hot POPCNT code was Claude's byte-count loop (`pcmpeqb`, `pmovmskb`,
+  `popcnt`, four per 64 bytes).
+
+With the mask count, that loop ran 65.0 guest instructions per iteration
+instead of 85.0 over the same 43,213 iterations of the ripgrep search.
+Claude's output becomes `94e5910f…` (from input `0f5efad9…a95a`); it passes
+version and help on QEMU Penryn with no emulator, and its five workloads.
+The region oracle (32,200 comparisons) and the lowering oracle (465,280)
+passed on lix-ory.
 
 ## Development
 
