@@ -238,9 +238,9 @@ version and help on QEMU Penryn with no emulator, and its five workloads.
 The region oracle (32,200 comparisons) and the lowering oracle (465,280)
 passed on lix-ory. A follow-up (`67f51ce`) puts the new constant in a
 section of its own, so outputs without a mask count keep their bytes (agy's
-`3f549ea2…`). nix-configs pins 0.2.0 in `a7362526`; iMacGBC has run it
-since generation 490 (2026-11-02, 17:15), where `claude --version` and
-`agy --version` emulate 0 instructions.
+`3f549ea2…`). nix-configs pinned 0.2.0 in `a7362526`; iMacGBC ran it in
+generation 490 (2026-11-02, 17:15), where `claude --version` and `agy
+--version` emulated 0 instructions.
 
 **2026-11-02, 0.3.0: POPCNT pairs.** In a fused region, two `popcnt r64,
 m64` with no memory access between them, and the later address unwritten,
@@ -271,6 +271,10 @@ are counted together (AGENTS.md, Decisions).
 
   The same oracle failed a lowering without the high-nibble mask, at
   Claude's region.
+
+nix-configs pins 0.3.0 in `53991d2d`; iMacGBC has run it since generation
+491 (2026-11-02, 23:52), where `claude --version` and `agy --version`
+emulate 0 instructions.
 
 ## Development
 
