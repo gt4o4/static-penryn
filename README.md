@@ -232,7 +232,10 @@ instead of 85.0 over the same 43,213 iterations of the ripgrep search.
 Claude's output becomes `94e5910f…` (from input `0f5efad9…a95a`); it passes
 version and help on QEMU Penryn with no emulator, and its five workloads.
 The region oracle (32,200 comparisons) and the lowering oracle (465,280)
-passed on lix-ory.
+passed on lix-ory. A follow-up (`67f51ce`) puts the new constant in a
+section of its own, so outputs without a mask count keep their bytes (agy's
+`3f549ea2…`). nix-configs pins 0.2.0 in `a7362526`, and iMacGBC takes it at
+its next switch.
 
 ## Development
 
