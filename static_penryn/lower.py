@@ -403,8 +403,11 @@ def support_assembly() -> str:
     for label, digits in (("55", "5555555555555555"), ("33", "3333333333333333"),
                           ("0f", "0f0f0f0f0f0f0f0f"), ("01", "0101010101010101")):
         lines += [f'.Lpenryn_pop{label}:', f'.quad 0x{digits}']
-    # 16 bytes of 1 for the PMOVMSKB-source count; legacy PAND needs alignment.
-    lines += ['.balign 16', '.Lpenryn_ones8:', '.quad 0x0101010101010101, 0x0101010101010101']
+    # 16 bytes of 1 for the PMOVMSKB-source count, in a section of their own
+    # so that --gc-sections drops them from an output that never counts one;
+    # legacy PAND needs the alignment.
+    lines += ['.section .rodata.penryn.ones8,"a",@progbits', '.balign 16', '.Lpenryn_ones8:',
+              '.quad 0x0101010101010101, 0x0101010101010101']
     return "\n".join(lines) + "\n"
 
 
