@@ -274,7 +274,8 @@ are counted together (AGENTS.md, Decisions).
 
 nix-configs pins 0.3.0 in `53991d2d`; iMacGBC has run it since generation
 491 (2026-11-02, 23:52), where `claude --version` and `agy --version`
-emulate 0 instructions.
+emulate 0 instructions, as did a Claude Code session on the 0.3.0 binary
+over its first two minutes.
 
 ## Development
 
