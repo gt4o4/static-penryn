@@ -41,9 +41,9 @@ static void initialize_mapping(void)
     initialized = true;
 }
 
-static void translate(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
+static void translate(struct qemu_plugin_tb *tb, void *userdata)
 {
-    (void)id;
+    (void)userdata;
     pthread_once(&mapping_once, initialize_mapping);
     if (!initialized) { return; }
     for (size_t i = 0; i < qemu_plugin_tb_n_insns(tb); i++) {
@@ -90,9 +90,9 @@ static void translate(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     }
 }
 
-static void finished(qemu_plugin_id_t id, void *userdata)
+static void finished(void *userdata)
 {
-    (void)id; (void)userdata;
+    (void)userdata;
     fprintf(output, "PENRYN1 %" PRIx64 " %u\n", bias, invalid || !initialized || !entry_seen);
     for (size_t i = 0; i < count; i++) {
         fprintf(output, "%u %" PRIu64 " %" PRIu64 "\n", rows[i].id,
@@ -148,7 +148,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     output = fopen(argv[2] + 7, "wx");
     if (!output) { return 1; }
     scores = qemu_plugin_scoreboard_new(count * 2 * sizeof(uint64_t));
-    qemu_plugin_register_vcpu_tb_trans_cb(id, translate);
+    qemu_plugin_register_vcpu_tb_trans_cb(id, translate, NULL);
     qemu_plugin_register_atexit_cb(id, finished, NULL);
     return 0;
 }

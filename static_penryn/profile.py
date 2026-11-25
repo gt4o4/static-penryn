@@ -320,7 +320,7 @@ def environment(home: str | Path) -> dict[str, str]:
 
 def build_plugin(work: str | Path) -> Path:
     output = Path(work) / 'penryn-profile.so'
-    # The unmodified QEMU 10.2.4 header uses GLib declarations. Nix wrappers
+    # The unmodified QEMU 11.1.2 header uses GLib declarations. Nix wrappers
     # can provide exact include flags; elsewhere use GLib's pkg-config data.
     flags = os.environ.get('PENRYN_GLIB_CFLAGS')
     if flags is None:
@@ -563,7 +563,8 @@ class Options(argparse.Namespace):
 def main() -> None:
     resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('mode', choices=['count', 'native'])
+    modes: tuple[str, ...] = ('count', 'native')
+    parser.add_argument('mode', choices=modes)
     parser.add_argument('binary', type=Path)
     parser.add_argument('report', type=Path)
     parser.add_argument('--work', type=Path, required=True)

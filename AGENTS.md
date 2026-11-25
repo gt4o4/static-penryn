@@ -170,8 +170,10 @@ binds a profile to its `output_sha256` and exact stub ranges, and
 - **The assembler shim is undefined behaviour by the C standard**, the
   owner's choice (2026-11-02); `assembler.py`'s docstring is its contract.
   - It was verified on glibc 2.42, LLVM 20.1.8, llvmlite 0.46.0 and TinyCC
-    0.9.27-unstable-2025-01-06; rerun `test_assembler` after any of them
-    changes.
+    0.9.27-unstable-2025-01-06, and on glibc 2.44, LLVM 22.1.8, llvmlite
+    0.49.0 and TinyCC 0.9.27-unstable-2026-09-22 (nixpkgs 26.11,
+    2026-11-26); rerun `test_assembler` after any of them changes.
+    `pyproject.toml` admits only the llvmlite releases it passed on.
   - Never put a Python frame between `setjmp` and LLVM.
   - Never `tcc_delete` the shim's state.
   - `abort()` is not caught.

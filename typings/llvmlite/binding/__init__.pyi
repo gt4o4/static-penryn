@@ -1,4 +1,4 @@
-# Typed surface of llvmlite 0.46.0 that static-penryn uses: LLVM's
+# Typed surface of llvmlite 0.46.0 and 0.49.0 that static-penryn uses: LLVM's
 # integrated assembler, reached through module-level inline assembly.
 from typing import Literal
 

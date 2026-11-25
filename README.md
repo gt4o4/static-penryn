@@ -137,9 +137,9 @@ env -u LD_PRELOAD qemu-x86_64 -cpu Penryn OUTPUT --version
   select work; a zero count never proves a site unreachable.
 - `static-penryn bench` makes paired native timings: alternating order, two
   warmups, and it refuses to start on a busy machine.
-- `profile_plugin.c` includes QEMU v10.2.4's unmodified `qemu-plugin.h`
-  (API 5, SHA-256 `aebc639d…5d4d`). Both are GPL-2.0-or-later
-  (`qemu-plugin.LICENSE`).
+- `profile_plugin.c` includes QEMU v11.1.2's unmodified `qemu-plugin.h`
+  (API 7, SHA-256 `335d4e47…d9f9`; QEMU 11.1 loads no plugin older than
+  API 7). Both are GPL-2.0-or-later (`qemu-plugin.LICENSE`).
 
 ## Records
 
@@ -276,6 +276,28 @@ nix-configs pins 0.3.0 in `53991d2d`; iMacGBC has run it since generation
 491 (2026-11-02, 23:52), where `claude --version` and `agy --version`
 emulate 0 instructions, as did a Claude Code session on the 0.3.0 binary
 over its first two minutes.
+
+**2026-11-26, nixpkgs 26.11.** nix-configs' recipe on NixOS 26.11: glibc
+2.44, GCC 16.2.0, Python 3.14.10, mypy 2.3.1, llvmlite 0.49.0 on LLVM
+22.1.8, TinyCC 0.9.27-unstable-2026-09-22, QEMU 11.1.2, and Go 1.26.11 for
+the Go tests (the release's default Go is 1.27.4).
+- Every module of AGENTS.md's list passed: `test_assembler` 2, `test_patch`
+  35, `test_dataflow` 25, `test_controlflow` 20, `test_integration` 8,
+  `test_profile` 13, `test_go_runtime` 13, `test_go_inplace` 8,
+  `test_runtime` 13, `test_native_frames` 27 and `test_regions`' 22 unit
+  tests. The type check passed. The hardware oracles were not rerun: no
+  lowering changed.
+- `test_assembler` is the shim's check for the new glibc, LLVM, llvmlite and
+  TinyCC; `pyproject.toml` admits llvmlite 0.46 and 0.49, the releases it
+  passed on.
+- QEMU 11.1 refused the profiler's plugin ("plugin requires API version 5,
+  but this QEMU supports only a minimum version of 7"). The plugin now
+  includes 11.1.2's header, whose translation and exit callbacks no longer
+  take the plugin id.
+- mypy 2.3.1 types a `choices` list literal from typeshed's `Iterable[Any]`,
+  which `disallow_any_expr` refuses: both `choices` are typed tuples.
+- With Go 1.27.4 the Go fixtures are refused ("unsupported Go runtime
+  layout: go1.27.4"), as AGENTS.md's Go 1.26 requirement says.
 
 ## Development
 
