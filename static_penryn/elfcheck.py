@@ -139,7 +139,10 @@ def validate_elf(data: bytes | bytearray, elf: ELFFile) -> ElfMetadata:
 
     # Static ET_EXEC function-pointer arrays lose their relocations at link
     # time; stripping symbols must not make their targets stealable. Restrict
-    # discovery to aligned words in allocated, non-code, file-backed sections.
+    # discovery to aligned words in allocated, non-code, file-backed sections,
+    # excluding Bun's post-link standalone bundle section (.bun: JS/bytecode
+    # payload, never linker-emitted native pointers; Claude Code 2.1.332's
+    # 235 MiB .bun held three words inside two POPCNTs).
     # An ET_DYN image's code pointers all carry relocations, which the dynamic
     # tables below add; an unrelocated word there is a number that may fall in
     # the code range by chance (antigravity-hub 2.28.2's language_server keeps
@@ -147,6 +150,7 @@ def validate_elf(data: bytes | bytearray, elf: ELFFile) -> ElfMetadata:
     if elf['e_type'] == 'ET_EXEC':
         for sec in sections:
             if (sec['sh_flags'] & 2 and not sec['sh_flags'] & (4 | 0x800)
+                    and sec.name != '.bun'
                     and sec['sh_type'] in ('SHT_PROGBITS', 'SHT_INIT_ARRAY',
                                            'SHT_FINI_ARRAY', 'SHT_PREINIT_ARRAY')):
                 begin = sec['sh_offset'] + (-sec['sh_addr'] % 8)

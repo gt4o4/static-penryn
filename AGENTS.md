@@ -309,16 +309,19 @@ On agy 1.2.7 the initializer ran once (37 instructions), and
     registers included. They never ran in the seven workloads, so that
     count is the whole measurement.
 - **A data word is a pointer target only in an ET_EXEC image
-  (2026-11-02).**
+  (2026-11-02; `.bun` excluded 2026-11-26).**
   - A static executable's pointer arrays lose their relocations at link
     time, so `elfcheck` protects every aligned data word that falls in
-    code.
+    code, except in `.bun` (Bun's post-link standalone JS/bytecode bundle,
+    which holds no linker-emitted native pointers; Claude Code 2.1.332's
+    235 MiB `.bun` had three words inside two POPCNTs).
   - A PIE's code pointers all carry RELA, REL or RELR relocations, so its
     unrelocated words are numbers.
   - antigravity-hub 2.28.2's `language_server` keeps 32-bit hashes beside
     relocated pointers in `.data.rel.ro`. One of them, `0x7fd9436`, fell
     inside a CRC32 and refused the whole run.
-  - `test_unrelocated_pie_word_is_not_a_pointer` holds the rule.
+  - `test_unrelocated_pie_word_is_not_a_pointer` and
+    `test_bun_payload_word_is_not_a_pointer` hold the rule.
 - **pwntools 4.15.0 loads the input.** Its `write()` silently skips an
   address with no file bytes, hence `patch.write_image`. Its GOT pass costs
   about 18 s on agy 1.4.12 and 3.3 s on Claude Code 2.1.316.

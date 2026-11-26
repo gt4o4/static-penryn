@@ -444,6 +444,29 @@ class PatchTests(unittest.TestCase):
         self.assertNotIn(entry, self.check_elf(binary)['pointer_targets'])
         self.penryn(self.invoke(binary, '--allow-relocate'))
 
+    def test_bun_payload_word_is_not_a_pointer(self) -> None:
+        # Bun appends its JS/bytecode bundle as an allocated .bun PROGBITS
+        # section in an ET_EXEC binary; words there are bundle payload, while
+        # ordinary ET_EXEC .data words stay protected as potential pointers.
+        binary = self.fixture(
+            'popcnt eax,ebx\n.Lentry:\nmov edi,eax',
+            extra='\n.section .bun,"a",@progbits\n.p2align 3\n.quad 0\n'
+                  '\n.data\n.p2align 3\n.quad 0\n',
+        )
+        elf = self.elf(binary)
+        text = elf.get_section_by_name('.text')
+        bun = elf.get_section_by_name('.bun')
+        data = elf.get_section_by_name('.data')
+        assert text is not None and bun is not None and data is not None
+        entry = text['sh_addr'] + 4
+        kept = text['sh_addr'] + 6
+        self.mutate(binary, '<Q', bun['sh_offset'], entry)
+        self.mutate(binary, '<Q', data['sh_offset'], kept)
+        targets = self.check_elf(binary)['pointer_targets']
+        self.assertNotIn(entry, targets)
+        self.assertIn(kept, targets)
+        self.penryn(self.invoke(binary, '--allow-relocate'))
+
     def test_exec_load_gaps_reported_without_decoding_data(self) -> None:
         binary = self.fixture('popcnt rax,rbx', link_extra=('-Wl,-z,noseparate-code',))
         metadata = self.check_elf(binary)
